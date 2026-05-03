@@ -1139,38 +1139,13 @@
   color: var(--text-secondary);
 }
 
-.ghcp-account-card .card-actions {
+.github-copilot-quota-list {
   display: flex;
-  gap: 6px;
-}
-
-.ghcp-account-card .card-action-btn {
-  width: 32px;
-  height: 32px;
-  border: none;
-  background: var(--bg-tertiary);
-  color: var(--text-secondary);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-.ghcp-account-card .card-action-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
-.ghcp-account-card .card-action-btn.success:hover {
-  background: var(--success);
-  color: white;
-}
-
-.ghcp-account-card .card-action-btn.danger:hover {
-  background: var(--danger);
-  color: white;
+  flex-direction: column;
+  gap: 12px;
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.02), rgba(15, 23, 42, 0.05));
+  border-radius: 12px;
+  padding: 12px;
 }
 
 /* 空状态 */

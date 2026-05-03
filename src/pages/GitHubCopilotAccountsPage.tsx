@@ -17,8 +17,6 @@ import {
   List,
   Search,
   ArrowDownWideNarrow,
-  Clock,
-  Calendar,
   Tag,
   ChevronDown,
   Play,
@@ -422,7 +420,7 @@ export function GitHubCopilotAccountsPage() {
       return (
         <div
           key={groupKey ? `${groupKey}-${account.id}` : account.id}
-          className={`ghcp-account-card ${isCurrent ? 'current' : ''} ${isSelected ? 'selected' : ''}`}
+          className={`account-card github-copilot-account-card ${isCurrent ? 'current' : ''} ${isSelected ? 'selected' : ''}`}
         >
           <div className="card-top">
             <div className="card-select">
@@ -460,62 +458,59 @@ export function GitHubCopilotAccountsPage() {
             </div>
           )}
 
-          <div className="ghcp-quota-section">
+          <div className="card-quota-list github-copilot-quota-list">
             {hasQuotaData ? (
               <>
-                <div className="quota-item">
-                  <div className="quota-header">
-                    <Clock size={14} />
-                    <span className="quota-label">{inlineUsage?.label ?? t('common.shared.quota.hourly', 'Inline Suggestions')}</span>
-                    <span className={`quota-pct ${inlineUsage?.quotaClass ?? 'high'}`}>
+                <div className="quota-compact-item">
+                  <div className="quota-compact-header">
+                    <span className="model-label">{inlineUsage?.label ?? t('common.shared.quota.hourly', 'Inline Suggestions')}</span>
+                    <span className={`model-pct ${inlineUsage?.quotaClass ?? 'high'}`}>
                       {inlineUsage?.valueText ?? '-'}
                     </span>
                   </div>
-                  <div className="quota-bar-track">
+                  <div className="quota-compact-bar-track">
                     <div
-                      className={`quota-bar ${inlineUsage?.quotaClass ?? 'high'}`}
+                      className={`quota-compact-bar ${inlineUsage?.quotaClass ?? 'high'}`}
                       style={{ width: `${inlineUsage?.percentage ?? 0}%` }}
                     />
                   </div>
                   {inlineUsage?.resetText && (
-                    <span className="quota-reset">
+                    <span className="quota-compact-reset">
                       {inlineUsage.resetText}
                     </span>
                   )}
                 </div>
 
-                <div className="quota-item">
-                  <div className="quota-header">
-                    <Calendar size={14} />
-                    <span className="quota-label">{chatUsage?.label ?? t('common.shared.quota.weekly', 'Chat messages')}</span>
-                    <span className={`quota-pct ${chatUsage?.quotaClass ?? 'high'}`}>
+                <div className="quota-compact-item">
+                  <div className="quota-compact-header">
+                    <span className="model-label">{chatUsage?.label ?? t('common.shared.quota.weekly', 'Chat messages')}</span>
+                    <span className={`model-pct ${chatUsage?.quotaClass ?? 'high'}`}>
                       {chatUsage?.valueText ?? '-'}
                     </span>
                   </div>
-                  <div className="quota-bar-track">
+                  <div className="quota-compact-bar-track">
                     <div
-                      className={`quota-bar ${chatUsage?.quotaClass ?? 'high'}`}
+                      className={`quota-compact-bar ${chatUsage?.quotaClass ?? 'high'}`}
                       style={{ width: `${chatUsage?.percentage ?? 0}%` }}
                     />
                   </div>
                   {chatUsage?.resetText && (
-                    <span className="quota-reset">
+                    <span className="quota-compact-reset">
                       {chatUsage.resetText}
                     </span>
                   )}
                 </div>
 
-                <div className="quota-item">
-                  <div className="quota-header">
-                    <CircleAlert size={14} />
-                    <span className="quota-label">{premiumUsage?.label ?? t('githubCopilot.columns.premium', 'Premium requests')}</span>
-                    <span className={`quota-pct ${premiumUsage?.quotaClass ?? 'high'}`}>
+                <div className="quota-compact-item">
+                  <div className="quota-compact-header">
+                    <span className="model-label">{premiumUsage?.label ?? t('githubCopilot.columns.premium', 'Premium requests')}</span>
+                    <span className={`model-pct ${premiumUsage?.quotaClass ?? 'high'}`}>
                       {premiumUsage?.valueText ?? '-'}
                     </span>
                   </div>
-                  <div className="quota-bar-track">
+                  <div className="quota-compact-bar-track">
                     <div
-                      className={`quota-bar ${premiumUsage?.quotaClass ?? 'high'}`}
+                      className={`quota-compact-bar ${premiumUsage?.quotaClass ?? 'high'}`}
                       style={{ width: `${premiumUsage?.percentage ?? 0}%` }}
                     />
                   </div>
@@ -739,7 +734,7 @@ export function GitHubCopilotAccountsPage() {
     });
 
   return (
-    <div className="ghcp-accounts-page">
+    <div className="ghcp-accounts-page accounts-page">
       <GitHubCopilotOverviewTabsHeader active={activeTab} onTabChange={setActiveTab} />
       <div className={`ghcp-flow-notice ${isFlowNoticeCollapsed ? 'collapsed' : ''}`} role="note" aria-live="polite">
         <button
@@ -1035,14 +1030,14 @@ export function GitHubCopilotAccountsPage() {
                   <span className="tag-group-title">{resolveGroupLabel(groupKey)}</span>
                   <span className="tag-group-count">{totalCount}</span>
                 </div>
-                <div className="tag-group-grid ghcp-accounts-grid">
+                <div className="tag-group-grid accounts-grid">
                   {renderGridCards(items, groupKey)}
                 </div>
               </div>
             ))}
           </div>
         ) : (
-          <div className="ghcp-accounts-grid">
+          <div className="accounts-grid">
             {renderGridCards(paginatedAccounts)}
           </div>
         )}
