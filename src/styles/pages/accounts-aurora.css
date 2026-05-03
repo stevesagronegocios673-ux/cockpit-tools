@@ -2,6 +2,11 @@
    Accounts Page - Aurora Refresh
    ============================================ */
 
+.accounts-page {
+  --accounts-primary: #1d4ed8;
+  --accounts-accent: #0ea5a5;
+}
+
 /* .main-content.accounts-page {
   position: relative;
   isolation: isolate;

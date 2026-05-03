@@ -33,7 +33,6 @@ import {
   ArrowUp,
   ArrowDown,
   GripVertical,
-  Clock,
   Calendar,
   Tag,
   Star,
@@ -3705,7 +3704,7 @@ export function CodexAccountsPage() {
       const subscriptionInfo = resolveSubscriptionPresentation(account);
       const isSubscriptionInfoMissing = subscriptionInfo.bucket === 'missing';
       return (
-        <div key={groupKey ? `${groupKey}-${account.id}` : account.id} className={`codex-account-card ${isCurrent ? 'current' : ''} ${isSelected ? 'selected' : ''}`}>
+        <div key={groupKey ? `${groupKey}-${account.id}` : account.id} className={`account-card codex-account-card ${isCurrent ? 'current' : ''} ${isSelected ? 'selected' : ''}`}>
           <div className="card-top">
             <div className="card-select"><input type="checkbox" checked={isSelected} onChange={() => toggleSelect(account.id)} /></div>
             {isEditingApiKeyName ? (
@@ -3785,7 +3784,7 @@ export function CodexAccountsPage() {
             </>
           )}
           {accountTags.length > 0 && (<div className="card-tags">{visibleTags.map((tag, idx) => (<span key={`${account.id}-${tag}-${idx}`} className="tag-pill">{tag}</span>))}{moreTagCount > 0 && <span className="tag-pill more">+{moreTagCount}</span>}</div>)}
-          <div className="codex-quota-section">
+          <div className="card-quota-grid">
             {isApiKeyAccount ? (
               <div className="quota-empty">
                 <span>{t('common.shared.quota.noData', '暂无配额数据')}</span>
@@ -3808,10 +3807,9 @@ export function CodexAccountsPage() {
                   </div>
                 )}
                 {quotaItems.map((item) => {
-                  const QuotaIcon = item.key === 'secondary' ? Calendar : item.key === 'code_review' ? BookOpen : Clock;
-                  return (<div key={item.key} className="quota-item"><div className="quota-header"><QuotaIcon size={14} /><span className="quota-label">{item.label}</span><span className={`quota-pct ${item.quotaClass}`}>{item.valueText}</span></div>
-                    <div className="quota-bar-track"><div className={`quota-bar ${item.quotaClass}`} style={{ width: `${item.percentage}%` }} /></div>
-                    {item.resetText && <span className="quota-reset">{item.resetText}</span>}</div>);
+                  return (<div key={item.key} className="quota-compact-item"><div className="quota-compact-header"><span className="model-label">{item.label}</span><span className={`model-pct ${item.quotaClass}`}>{item.valueText}</span></div>
+                    <div className="quota-compact-bar-track"><div className={`quota-compact-bar ${item.quotaClass}`} style={{ width: `${item.percentage}%` }} /></div>
+                    {item.resetText && <span className="quota-compact-reset">{item.resetText}</span>}</div>);
                 })}
                 {quotaItems.length === 0 && (<div className="quota-empty">{t('common.shared.quota.noData', '暂无配额数据')}</div>)}
               </>
@@ -3835,10 +3833,9 @@ export function CodexAccountsPage() {
               )}
             </div>
           )}
-          <div className="codex-card-bottom">
+          <div className="card-footer">
             <span className="card-date">{formatDate(account.created_at)}</span>
-            <div className="card-footer">
-              <div className="card-actions">
+            <div className="card-actions">
                 <button
                   className="card-action-btn"
                   onClick={() => void handleLaunchCodexCli(account)}
@@ -3886,7 +3883,6 @@ export function CodexAccountsPage() {
                   <Upload size={14} />
                 </button>
                 <button className="card-action-btn danger" onClick={() => handleDelete(account.id)} title={t('common.delete', '删除')}><Trash2 size={14} /></button>
-              </div>
             </div>
           </div>
         </div>
@@ -3932,7 +3928,7 @@ export function CodexAccountsPage() {
     return (
       <div
         key="codex-local-access-card"
-        className={`codex-account-card folder-inline-card codex-local-access-card codex-local-access-card--${overviewLayoutMode} ${
+        className={`account-card codex-account-card folder-inline-card codex-local-access-card codex-local-access-card--${overviewLayoutMode} ${
           showLocalAccessDetails ? 'is-expanded' : 'is-collapsed'
         }`}
       >
@@ -4219,7 +4215,7 @@ export function CodexAccountsPage() {
         return (
           <div
             key={`codex-folder-${group.id}`}
-            className="codex-account-card folder-inline-card codex-group-folder-card"
+            className="account-card codex-account-card folder-inline-card codex-group-folder-card"
             onClick={() => handleEnterGroup(group.id)}
           >
             <div className="folder-inline-header">
@@ -4603,7 +4599,7 @@ export function CodexAccountsPage() {
     !groupByTag && !activeGroupId && paginatedAccounts.length > 0;
 
   return (
-    <div className={`codex-accounts-page codex-accounts-page--${overviewLayoutMode}`}>
+    <div className={`codex-accounts-page accounts-page codex-accounts-page--${overviewLayoutMode}`}>
       <CodexOverviewTabsHeader
         active={activeTab}
         onTabChange={setActiveTab}
@@ -4808,13 +4804,13 @@ export function CodexAccountsPage() {
                             <span className="tag-group-title">{resolveGroupLabel(groupKey)}</span>
                             <span className="tag-group-count">{totalCount}</span>
                           </div>
-                          <div className="tag-group-grid codex-accounts-grid">{renderGridCards(items, groupKey)}</div>
+                          <div className="tag-group-grid accounts-grid">{renderGridCards(items, groupKey)}</div>
                         </div>
                       ))}
                     </div>
                   </>
                 ) : (
-                  <div className="codex-accounts-grid">{inlineFolderCards}{renderGridCards(paginatedAccounts)}</div>
+                  <div className="accounts-grid">{inlineFolderCards}{renderGridCards(paginatedAccounts)}</div>
                 )}
               </div>
             ) : groupByTag ? (

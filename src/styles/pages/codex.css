@@ -11,13 +11,6 @@
 
 /* 使用通用的 page-header 样式，不再覆盖 */
 
-/* Codex 账号网格 */
-.codex-accounts-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 20px;
-}
-
 .codex-group-entry-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -787,65 +780,6 @@
   animation: fadeUp 0.35s ease both;
 }
 
-/* Codex 账号卡片 */
-.codex-account-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 20px;
-  box-shadow: var(--shadow-sm);
-  backdrop-filter: blur(10px);
-  transition: all 0.25s ease;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-height: 260px;
-}
-
-.codex-account-card:hover {
-  box-shadow: var(--shadow-md);
-  transform: translateY(-2px);
-}
-
-.codex-account-card.current {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 2px var(--primary-light), var(--shadow-md);
-}
-
-.codex-account-card.selected {
-  border-color: var(--primary);
-  background: var(--primary-light);
-}
-
-.codex-account-card .card-top {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.codex-account-card .card-select {
-  flex-shrink: 0;
-}
-
-.codex-account-card .card-select input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  cursor: pointer;
-  accent-color: var(--primary);
-}
-
-.codex-account-card .account-email {
-  flex: 1;
-  min-width: 0;
-  font-weight: 600;
-  font-size: 14px;
-  color: var(--text-primary);
-  background: transparent;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .codex-accounts-page .account-email.editable,
 .codex-accounts-page .account-email-text.editable {
   cursor: text;
@@ -862,17 +796,6 @@
   outline: none;
 }
 
-.codex-account-card .current-tag {
-  flex-shrink: 0;
-  padding: 3px 10px;
-  background: var(--success);
-  color: white;
-  font-size: 11px;
-  font-weight: 600;
-  border-radius: var(--radius-full);
-}
-
-.codex-account-card .tier-badge,
 .codex-accounts-page .account-table .tier-badge {
   display: inline-flex;
   align-items: center;
@@ -888,7 +811,6 @@
   white-space: nowrap;
 }
 
-.codex-account-card .tier-badge::before,
 .codex-accounts-page .account-table .tier-badge::before {
   display: none;
 }
@@ -1119,100 +1041,6 @@
   font-size: 12px;
 }
 
-/* 配额部分 */
-.codex-quota-section {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.codex-quota-section .quota-item {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.codex-quota-section .quota-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.codex-quota-section .quota-header svg {
-  flex-shrink: 0;
-  color: var(--text-secondary);
-}
-
-.codex-quota-section .quota-label {
-  flex: 1;
-}
-
-.codex-quota-section .quota-pct {
-  font-weight: 700;
-  font-size: 13px;
-}
-
-.codex-quota-section .quota-pct.high {
-  color: var(--success);
-}
-
-.codex-quota-section .quota-pct.medium {
-  color: #f59e0b;
-}
-
-.codex-quota-section .quota-pct.low {
-  color: #f97316;
-}
-
-.codex-quota-section .quota-pct.critical {
-  color: var(--danger);
-}
-
-.codex-quota-section .quota-bar-track {
-  height: 6px;
-  background: var(--bg-tertiary);
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.codex-quota-section .quota-bar {
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s ease;
-}
-
-.codex-quota-section .quota-bar.high {
-  background: linear-gradient(90deg, #22c55e, #16a34a);
-}
-
-.codex-quota-section .quota-bar.medium {
-  background: linear-gradient(90deg, #f59e0b, #d97706);
-}
-
-.codex-quota-section .quota-bar.low {
-  background: linear-gradient(90deg, #f97316, #ea580c);
-}
-
-.codex-quota-section .quota-bar.critical {
-  background: linear-gradient(90deg, #ef4444, #dc2626);
-}
-
-.codex-quota-section .quota-reset {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.codex-quota-section .quota-empty {
-  font-size: 12px;
-  color: var(--text-muted);
-  text-align: center;
-  padding: 12px;
-  background: var(--bg-tertiary);
-  border-radius: var(--radius-sm);
-}
-
 .codex-accounts-page .quota-error-inline {
   display: inline-flex;
   align-items: center;
@@ -1228,65 +1056,6 @@
 
 .codex-accounts-page .quota-error-inline.table {
   margin-top: 8px;
-}
-
-/* 卡片底部 */
-.codex-account-card .codex-card-bottom {
-  margin-top: auto;
-}
-
-.codex-account-card .card-footer {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-light);
-}
-
-.codex-account-card .card-date {
-  display: block;
-  margin-bottom: 8px;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.codex-account-card .card-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.codex-account-card .card-action-btn {
-  width: 32px;
-  height: 32px;
-  border: none;
-  background: var(--bg-tertiary);
-  color: var(--text-secondary);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-.codex-account-card .card-action-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
-.codex-account-card .card-action-btn:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
-.codex-account-card .card-action-btn.success:hover {
-  background: var(--success);
-  color: white;
-}
-
-.codex-account-card .card-action-btn.danger:hover {
-  background: var(--danger);
-  color: white;
 }
 
 /* Compact 布局（新增，不影响原 grid/list） */
@@ -3364,11 +3133,6 @@
   padding-top: 20px;
   border-top: 1px solid var(--border-light);
   margin-top: 20px;
-}
-
-/* Dark mode */
-[data-theme="dark"] .codex-account-card {
-  background: linear-gradient(170deg, rgba(15, 23, 42, 0.95), rgba(15, 23, 42, 0.8));
 }
 
 [data-theme="dark"] .codex-accounts-page .message-bar.success {
