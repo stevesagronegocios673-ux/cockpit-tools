@@ -73,6 +73,7 @@ pub mod wakeup_gateway;
 // pub mod web_report;
 pub mod websocket;
 pub mod windsurf_account;
+pub mod windsurf_devin_oauth;
 pub mod windsurf_instance;
 pub mod windsurf_oauth;
 pub mod workbuddy_account;
