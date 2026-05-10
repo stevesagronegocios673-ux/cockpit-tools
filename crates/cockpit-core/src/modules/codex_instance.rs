@@ -405,6 +405,58 @@ fn paths_point_to_same_location(a: &Path, b: &Path) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn files_are_same_entry(a: &Path, b: &Path) -> Result<bool, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn read_file_identity(path: &Path) -> Result<(u32, u32, u32), String> {
+        let file = fs::File::open(path).map_err(|e| {
+            format!(
+                "read file identity open failed ({}): {}",
+                display_abs_path(path),
+                e
+            )
+        })?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe {
+            GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info).map_err(|e| {
+                format!(
+                    "read file identity failed ({}): {}",
+                    display_abs_path(path),
+                    e
+                )
+            })?;
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
+
+    Ok(read_file_identity(a)? == read_file_identity(b)?)
+}
+
+#[cfg(unix)]
+fn files_are_same_entry(a: &Path, b: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta_a = fs::metadata(a)
+        .map_err(|e| format!("read file metadata failed ({}): {}", display_abs_path(a), e))?;
+    let meta_b = fs::metadata(b)
+        .map_err(|e| format!("read file metadata failed ({}): {}", display_abs_path(b), e))?;
+    Ok(meta_a.dev() == meta_b.dev() && meta_a.ino() == meta_b.ino())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn files_are_same_entry(a: &Path, b: &Path) -> Result<bool, String> {
+    Ok(paths_point_to_same_location(a, b))
+}
+
 fn display_abs_path(path: &Path) -> String {
     instance_store::display_path(path)
 }
@@ -653,6 +705,10 @@ fn sync_shared_directory_preserving_entries(
         return create_directory_live_link(&global_dir, &instance_dir);
     }
 
+    if metadata.is_dir() && paths_point_to_same_location(&instance_dir, &global_dir) {
+        return Ok(());
+    }
+
     if !metadata.is_dir() {
         return Err(format!(
             "å®žä¾‹å…±äº«ç›®å½•è·¯å¾„ä¸æ˜¯ç›®å½• ({}): {}",
@@ -787,6 +843,10 @@ fn sync_shared_file(
         }
         remove_symlink(&instance_file)?;
         return create_file_symlink(&global_file, &instance_file);
+    }
+
+    if instance_meta.is_file() && files_are_same_entry(&instance_file, &global_file)? {
+        return Ok(());
     }
 
     if !instance_meta.is_file() {
@@ -1301,6 +1361,31 @@ mod tests {
     }
 
     #[test]
+    fn windows_shared_file_preserves_existing_hard_link() {
+        let root = make_temp_dir("codex-file-hard-link-test");
+        let default_home = root.join("default");
+        let profile_dir = root.join("instance");
+        let global_file = default_home.join("state_5.sqlite");
+        let instance_file = profile_dir.join("state_5.sqlite");
+        fs::create_dir_all(&default_home).expect("create default home");
+        fs::create_dir_all(&profile_dir).expect("create profile dir");
+        fs::write(&global_file, "shared").expect("write global file");
+        fs::hard_link(&global_file, &instance_file).expect("create instance hard link");
+
+        sync_shared_file(&profile_dir, &default_home, Path::new("state_5.sqlite"))
+            .expect("sync shared hard-linked file");
+
+        assert!(files_are_same_entry(&instance_file, &global_file).expect("compare file entries"));
+        fs::write(&global_file, "updated").expect("update global hard-linked file");
+        assert_eq!(
+            fs::read_to_string(&instance_file).expect("read instance hard-linked file"),
+            "updated"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn windows_directory_shared_link_copies_when_link_methods_fail() {
         let root = make_temp_dir("codex-dir-copy-fallback-test");
         let source = root.join("global-skills");
@@ -1320,6 +1405,35 @@ mod tests {
         let content =
             fs::read_to_string(target.join("nested").join("probe.txt")).expect("read copied file");
         assert_eq!(content, "shared");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windows_shared_session_directory_accepts_existing_junction() {
+        let root = make_temp_dir("codex-session-junction-test");
+        let default_home = root.join("default");
+        let profile_dir = root.join("instance");
+        let global_sessions = default_home.join("sessions");
+        let instance_sessions = profile_dir.join("sessions");
+        fs::create_dir_all(&global_sessions).expect("create global sessions");
+        fs::create_dir_all(&profile_dir).expect("create profile dir");
+        create_directory_junction(&global_sessions, &instance_sessions)
+            .expect("create instance session junction");
+
+        sync_shared_directory_preserving_entries(
+            &profile_dir,
+            &default_home,
+            Path::new("sessions"),
+        )
+        .expect("sync existing session junction");
+
+        fs::write(global_sessions.join("global.jsonl"), "global").expect("write global session");
+        assert_eq!(
+            fs::read_to_string(instance_sessions.join("global.jsonl"))
+                .expect("read global session through junction"),
+            "global"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

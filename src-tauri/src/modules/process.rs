@@ -7070,13 +7070,16 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
     {
         crate::modules::logger::log_info("Closing managed Codex instances...");
 
-        let target_dirs: HashSet<String> = codex_homes
+        let target_specs: Vec<(String, bool)> = codex_homes
             .iter()
-            .filter_map(|home| {
-                resolve_codex_target_and_fallback(Some(home)).map(|(target, _)| target)
-            })
-            .filter(|value| !value.is_empty())
+            .filter_map(|home| resolve_codex_target_and_fallback(Some(home)))
+            .filter(|(target, _)| !target.is_empty())
             .collect();
+        let target_dirs: HashSet<String> = target_specs
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect();
+        let allow_none_for_target = target_specs.iter().any(|(_, allow_none)| *allow_none);
         if target_dirs.is_empty() {
             crate::modules::logger::log_info("No managed Codex instance directories were provided");
             return Ok(());
@@ -7088,11 +7091,11 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
                 let normalized = dir
                     .as_ref()
                     .map(|value| normalize_path_for_compare(value))
-                    .filter(|value| !value.is_empty())?;
-                if target_dirs.contains(&normalized) {
-                    Some(pid)
-                } else {
-                    None
+                    .filter(|value| !value.is_empty());
+                match normalized {
+                    Some(value) if target_dirs.contains(&value) => Some(pid),
+                    None if allow_none_for_target => Some(pid),
+                    _ => None,
                 }
             })
             .collect();
@@ -7110,11 +7113,14 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
         let _ = close_pids(&pids, timeout_secs);
 
         let still_running = collect_codex_process_entries().into_iter().any(|(_, dir)| {
-            dir.as_ref()
+            match dir
+                .as_ref()
                 .map(|value| normalize_path_for_compare(value))
                 .filter(|value| !value.is_empty())
-                .map(|value| target_dirs.contains(&value))
-                .unwrap_or(false)
+            {
+                Some(value) => target_dirs.contains(&value),
+                None => allow_none_for_target,
+            }
         });
         if still_running {
             return Err(
