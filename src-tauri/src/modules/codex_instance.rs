@@ -19,6 +19,13 @@ const CODEX_SHARED_SKILLS_DIR_NAME: &str = "skills";
 const CODEX_SHARED_RULES_DIR_NAME: &str = "rules";
 const CODEX_SHARED_AGENTS_FILE_NAME: &str = "AGENTS.md";
 const CODEX_SHARED_VENDOR_IMPORTS_SKILLS_DIR: &str = "vendor_imports/skills";
+const CODEX_SHARED_SESSIONS_DIR_NAME: &str = "sessions";
+const CODEX_SHARED_ARCHIVED_SESSIONS_DIR_NAME: &str = "archived_sessions";
+const CODEX_SHARED_SESSION_INDEX_FILE_NAME: &str = "session_index.jsonl";
+const CODEX_SHARED_GLOBAL_STATE_FILE_NAME: &str = ".codex-global-state.json";
+const CODEX_SHARED_STATE_DB_FILE_NAME: &str = "state_5.sqlite";
+const CODEX_SHARED_STATE_DB_WAL_FILE_NAME: &str = "state_5.sqlite-wal";
+const CODEX_SHARED_STATE_DB_SHM_FILE_NAME: &str = "state_5.sqlite-shm";
 
 pub fn is_api_service_bind_account_id(account_id: &str) -> bool {
     account_id.trim() == CODEX_API_SERVICE_BIND_ACCOUNT_ID
@@ -515,6 +522,138 @@ fn sync_shared_directory(
     })
 }
 
+fn copy_missing_directory_entries(source: &Path, target: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(target).map_err(|e| {
+        format!(
+            "åˆ›å»ºå…±äº«ç›®å½•åˆå¹¶ç›®æ ‡å¤±è´¥ ({}): {}",
+            display_abs_path(target),
+            e
+        )
+    })?;
+
+    for entry in fs::read_dir(source).map_err(|e| {
+        format!(
+            "è¯»å–å…±äº«ç›®å½•åˆå¹¶æ¥æºå¤±è´¥ ({}): {}",
+            display_abs_path(source),
+            e
+        )
+    })? {
+        let entry = entry.map_err(|e| format!("è¯»å–å…±äº«ç›®å½•é¡¹å¤±è´¥: {}", e))?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let source_meta = fs::symlink_metadata(&source_path).map_err(|e| {
+            format!(
+                "è¯»å–å…±äº«ç›®å½•åˆå¹¶æ¥æºé¡¹å¤±è´¥ ({}): {}",
+                display_abs_path(&source_path),
+                e
+            )
+        })?;
+
+        if source_meta.is_dir() {
+            copy_missing_directory_entries(&source_path, &target_path)?;
+            continue;
+        }
+
+        if target_path.exists() {
+            continue;
+        }
+
+        fs::copy(&source_path, &target_path).map_err(|e| {
+            format!(
+                "åˆå¹¶å…±äº«ç›®å½•æ–‡ä»¶å¤±è´¥ ({} -> {}): {}",
+                display_abs_path(&source_path),
+                display_abs_path(&target_path),
+                e
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn sync_shared_directory_preserving_entries(
+    profile_dir: &Path,
+    default_codex_home: &Path,
+    relative_path: &Path,
+) -> Result<(), String> {
+    let global_dir = default_codex_home.join(relative_path);
+    let instance_dir = profile_dir.join(relative_path);
+    let relative_display = relative_path.to_string_lossy();
+
+    fs::create_dir_all(&global_dir).map_err(|e| {
+        format!(
+            "åˆ›å»ºå…¨å±€å…±äº«ç›®å½•å¤±è´¥ ({}): {}",
+            display_abs_path(&global_dir),
+            e
+        )
+    })?;
+    if let Some(parent) = instance_dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "åˆ›å»ºå®žä¾‹å…±äº«ç›®å½•çˆ¶è·¯å¾„å¤±è´¥ ({}): {}",
+                display_abs_path(parent),
+                e
+            )
+        })?;
+    }
+
+    if !instance_dir.exists() {
+        return create_directory_symlink(&global_dir, &instance_dir);
+    }
+
+    let metadata = fs::symlink_metadata(&instance_dir).map_err(|e| {
+        format!(
+            "è¯»å–å®žä¾‹å…±äº«ç›®å½•ä¿¡æ¯å¤±è´¥ ({}): {}",
+            display_abs_path(&instance_dir),
+            e
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        let current_target = fs::read_link(&instance_dir).map_err(|e| {
+            format!(
+                "è¯»å–å®žä¾‹å…±äº«ç›®å½•é“¾æŽ¥å¤±è´¥ ({}): {}",
+                display_abs_path(&instance_dir),
+                e
+            )
+        })?;
+        let resolved_target = resolve_link_target(&instance_dir, current_target);
+        if paths_point_to_same_location(&resolved_target, &global_dir) {
+            return Ok(());
+        }
+        remove_symlink(&instance_dir)?;
+        return create_directory_symlink(&global_dir, &instance_dir);
+    }
+
+    if !metadata.is_dir() {
+        return Err(format!(
+            "å®žä¾‹å…±äº«ç›®å½•è·¯å¾„ä¸æ˜¯ç›®å½• ({}): {}",
+            relative_display,
+            display_abs_path(&instance_dir)
+        ));
+    }
+
+    copy_missing_directory_entries(&instance_dir, &global_dir)?;
+    fs::remove_dir_all(&instance_dir).map_err(|e| {
+        format!(
+            "æ¸…ç†å®žä¾‹å…±äº«ç›®å½•å¤±è´¥ ({}): {}",
+            display_abs_path(&instance_dir),
+            e
+        )
+    })?;
+    create_directory_symlink(&global_dir, &instance_dir).map_err(|e| {
+        format!(
+            "é‡å»ºå®žä¾‹å…±äº«ç›®å½•é“¾æŽ¥å¤±è´¥ ({} -> {}, {}): {}",
+            display_abs_path(&global_dir),
+            display_abs_path(&instance_dir),
+            relative_display,
+            e
+        )
+    })
+}
+
 fn sync_shared_file(
     profile_dir: &Path,
     default_codex_home: &Path,
@@ -661,6 +800,65 @@ fn sync_shared_file(
     })
 }
 
+fn backup_instance_shared_file_if_needed(
+    profile_dir: &Path,
+    default_codex_home: &Path,
+    relative_path: &Path,
+) -> Result<(), String> {
+    let global_file = default_codex_home.join(relative_path);
+    let instance_file = profile_dir.join(relative_path);
+    if !global_file.exists() || !instance_file.exists() {
+        return Ok(());
+    }
+
+    let instance_meta = fs::symlink_metadata(&instance_file).map_err(|e| {
+        format!(
+            "è¯»å–å®žä¾‹å…±äº«æ–‡ä»¶ä¿¡æ¯å¤±è´¥ ({}): {}",
+            display_abs_path(&instance_file),
+            e
+        )
+    })?;
+    if instance_meta.file_type().is_symlink() || !instance_meta.is_file() {
+        return Ok(());
+    }
+    if files_have_same_content(&instance_file, &global_file)? {
+        return Ok(());
+    }
+
+    let backup_path = profile_dir
+        .join(".cockpit-shared-history-backups")
+        .join(Utc::now().format("%Y%m%d%H%M%S%3f").to_string())
+        .join(relative_path);
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "åˆ›å»ºå…±äº«åŽ†å²å¤‡ä»½ç›®å½•å¤±è´¥ ({}): {}",
+                display_abs_path(parent),
+                e
+            )
+        })?;
+    }
+    fs::copy(&instance_file, &backup_path).map_err(|e| {
+        format!(
+            "å¤‡ä»½å®žä¾‹åŽ†å²æ–‡ä»¶å¤±è´¥ ({} -> {}): {}",
+            display_abs_path(&instance_file),
+            display_abs_path(&backup_path),
+            e
+        )
+    })?;
+
+    Ok(())
+}
+
+fn sync_shared_history_file(
+    profile_dir: &Path,
+    default_codex_home: &Path,
+    relative_path: &Path,
+) -> Result<(), String> {
+    backup_instance_shared_file_if_needed(profile_dir, default_codex_home, relative_path)?;
+    sync_shared_file(profile_dir, default_codex_home, relative_path)
+}
+
 pub fn ensure_instance_shared_skills(profile_dir: &Path) -> Result<(), String> {
     let default_codex_home = get_default_codex_home()?;
     if paths_point_to_same_location(profile_dir, &default_codex_home) {
@@ -687,6 +885,41 @@ pub fn ensure_instance_shared_skills(profile_dir: &Path) -> Result<(), String> {
         profile_dir,
         &default_codex_home,
         Path::new(CODEX_SHARED_AGENTS_FILE_NAME),
+    )?;
+    sync_shared_directory_preserving_entries(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_SESSIONS_DIR_NAME),
+    )?;
+    sync_shared_directory_preserving_entries(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_ARCHIVED_SESSIONS_DIR_NAME),
+    )?;
+    sync_shared_history_file(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_SESSION_INDEX_FILE_NAME),
+    )?;
+    sync_shared_history_file(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_GLOBAL_STATE_FILE_NAME),
+    )?;
+    sync_shared_history_file(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_STATE_DB_FILE_NAME),
+    )?;
+    sync_shared_history_file(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_STATE_DB_WAL_FILE_NAME),
+    )?;
+    sync_shared_history_file(
+        profile_dir,
+        &default_codex_home,
+        Path::new(CODEX_SHARED_STATE_DB_SHM_FILE_NAME),
     )?;
 
     Ok(())
@@ -1061,6 +1294,40 @@ mod tests {
         let content =
             fs::read_to_string(target.join("nested").join("probe.txt")).expect("read copied file");
         assert_eq!(content, "shared");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windows_shared_session_directory_preserves_instance_entries() {
+        let root = make_temp_dir("codex-session-share-test");
+        let default_home = root.join("default");
+        let profile_dir = root.join("instance");
+        let global_sessions = default_home.join("sessions");
+        let instance_sessions = profile_dir.join("sessions");
+        fs::create_dir_all(&global_sessions).expect("create global sessions");
+        fs::create_dir_all(&instance_sessions).expect("create instance sessions");
+        fs::write(global_sessions.join("global.jsonl"), "global").expect("write global session");
+        fs::write(instance_sessions.join("instance.jsonl"), "instance")
+            .expect("write instance session");
+
+        sync_shared_directory_preserving_entries(
+            &profile_dir,
+            &default_home,
+            Path::new("sessions"),
+        )
+        .expect("share sessions");
+
+        assert_eq!(
+            fs::read_to_string(global_sessions.join("instance.jsonl"))
+                .expect("read merged session"),
+            "instance"
+        );
+        assert_eq!(
+            fs::read_to_string(instance_sessions.join("global.jsonl"))
+                .expect("read shared global session"),
+            "global"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -515,14 +515,20 @@ pub async fn codex_start_instance(instance_id: String) -> Result<CodexInstancePr
         .find(|item| item.id == instance_id)
         .ok_or("实例不存在")?;
 
-    modules::codex_instance::ensure_instance_shared_skills(Path::new(&instance.user_data_dir))?;
-
     if let Some(pid) =
         modules::process::resolve_codex_pid(instance.last_pid, Some(&instance.user_data_dir))
     {
         modules::process::close_pid(pid, 20)?;
         let _ = modules::codex_instance::update_instance_pid(&instance.id, None)?;
     }
+
+    if let Err(error) = modules::codex_thread_sync::sync_threads_across_instances() {
+        modules::logger::log_warn(&format!(
+            "Codex session sync before instance start failed: {}",
+            error
+        ));
+    }
+    modules::codex_instance::ensure_instance_shared_skills(Path::new(&instance.user_data_dir))?;
 
     if let Some(ref account_id) = instance.bind_account_id {
         inject_bound_account_to_profile(Path::new(&instance.user_data_dir), account_id).await?;
