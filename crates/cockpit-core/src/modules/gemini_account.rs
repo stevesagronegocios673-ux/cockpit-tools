@@ -1710,7 +1710,7 @@ fn sync_default_gemini_home_to_wsl() {
     let target_home_str = target_home.to_string_lossy().to_string();
 
     let script = format!(
-        "mkdir -p ~/.gemini && cp -rf \"$(wslpath -u '{}')\"/* ~/.gemini/ 2>/dev/null || true",
+        "mkdir -p ~/.gemini && cd \"$(wslpath -u '{}')\" && cp -f oauth_creds.json google_accounts.json settings.json ~/.gemini/ 2>/dev/null || true && rm -f ~/.gemini/gemini-credentials.json 2>/dev/null || true",
         target_home_str.replace('\'', "'\\''")
     );
 
