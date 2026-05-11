@@ -1,9 +1,10 @@
 use crate::models::codex::{CodexAccount, CodexApiProviderMode};
 use crate::models::codex_local_access::{
     CodexLocalAccessAccountStats, CodexLocalAccessApiKey, CodexLocalAccessApiKeyStats,
-    CodexLocalAccessCollection, CodexLocalAccessPortCleanupResult, CodexLocalAccessRoutingStrategy,
-    CodexLocalAccessState, CodexLocalAccessStats, CodexLocalAccessStatsWindow,
-    CodexLocalAccessUpstreamSource, CodexLocalAccessUsageEvent, CodexLocalAccessUsageStats,
+    CodexLocalAccessCollection, CodexLocalAccessModelStats, CodexLocalAccessPortCleanupResult,
+    CodexLocalAccessRoutingStrategy, CodexLocalAccessState, CodexLocalAccessStats,
+    CodexLocalAccessStatsWindow, CodexLocalAccessUpstreamSource, CodexLocalAccessUsageEvent,
+    CodexLocalAccessUsageStats,
 };
 use crate::modules::atomic_write::write_string_atomic;
 use crate::modules::{codex_account, codex_oauth, codex_wakeup, logger, process};
@@ -2618,27 +2619,9 @@ fn empty_stats_snapshot() -> CodexLocalAccessStats {
         totals: CodexLocalAccessUsageStats::default(),
         accounts: Vec::new(),
         api_keys: Vec::new(),
-        daily: CodexLocalAccessStatsWindow {
-            since: day_since,
-            updated_at: now,
-            totals: CodexLocalAccessUsageStats::default(),
-            accounts: Vec::new(),
-            api_keys: Vec::new(),
-        },
-        weekly: CodexLocalAccessStatsWindow {
-            since: week_since,
-            updated_at: now,
-            totals: CodexLocalAccessUsageStats::default(),
-            accounts: Vec::new(),
-            api_keys: Vec::new(),
-        },
-        monthly: CodexLocalAccessStatsWindow {
-            since: month_since,
-            updated_at: now,
-            totals: CodexLocalAccessUsageStats::default(),
-            accounts: Vec::new(),
-            api_keys: Vec::new(),
-        },
+        daily: empty_stats_window(day_since, now),
+        weekly: empty_stats_window(week_since, now),
+        monthly: empty_stats_window(month_since, now),
         events: Vec::new(),
     }
 }
@@ -2650,6 +2633,7 @@ fn empty_stats_window(since: i64, updated_at: i64) -> CodexLocalAccessStatsWindo
         totals: CodexLocalAccessUsageStats::default(),
         accounts: Vec::new(),
         api_keys: Vec::new(),
+        models: Vec::new(),
     }
 }
 
@@ -2673,6 +2657,35 @@ fn sort_usage_api_keys(api_keys: &mut [CodexLocalAccessApiKeyStats]) {
             .then_with(|| right.updated_at.cmp(&left.updated_at))
             .then_with(|| left.api_key_id.cmp(&right.api_key_id))
     });
+}
+
+fn sort_usage_models(models: &mut [CodexLocalAccessModelStats]) {
+    models.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| right.usage.request_count.cmp(&left.usage.request_count))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+}
+
+fn sort_window_usage_breakdowns(window: &mut CodexLocalAccessStatsWindow) {
+    sort_usage_accounts(&mut window.accounts);
+    sort_usage_api_keys(&mut window.api_keys);
+    sort_usage_models(&mut window.models);
+    for api_key in &mut window.api_keys {
+        sort_usage_models(&mut api_key.models);
+    }
+}
+
+fn normalize_usage_model_id(model_id: Option<&str>) -> String {
+    model_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn trim_recent_events(events: &mut Vec<CodexLocalAccessUsageEvent>, month_since: i64) {
@@ -2737,6 +2750,14 @@ fn apply_usage_event_to_window(
         event.latency_ms,
         Some(&usage),
     );
+    upsert_model_usage_stats(
+        &mut window.models,
+        Some(event.model_id.as_str()),
+        event.success,
+        event.latency_ms,
+        Some(&usage),
+        event.timestamp,
+    );
     let source_metadata = LocalAccessSourceMetadata {
         source_type: event.source_type.clone().unwrap_or_default(),
         provider_name: event.provider_name.clone(),
@@ -2760,6 +2781,7 @@ fn apply_usage_event_to_window(
         event.latency_ms,
         Some(&usage),
         event.timestamp,
+        Some(event.model_id.as_str()),
     );
     window.updated_at = window.updated_at.max(event.timestamp);
 }
@@ -2787,12 +2809,9 @@ fn recompute_time_windows(stats: &mut CodexLocalAccessStats, now: i64) {
         }
     }
 
-    sort_usage_accounts(&mut daily.accounts);
-    sort_usage_accounts(&mut weekly.accounts);
-    sort_usage_accounts(&mut monthly.accounts);
-    sort_usage_api_keys(&mut daily.api_keys);
-    sort_usage_api_keys(&mut weekly.api_keys);
-    sort_usage_api_keys(&mut monthly.api_keys);
+    sort_window_usage_breakdowns(&mut daily);
+    sort_window_usage_breakdowns(&mut weekly);
+    sort_window_usage_breakdowns(&mut monthly);
 
     stats.daily = daily;
     stats.weekly = weekly;
@@ -3054,6 +3073,9 @@ fn normalize_stats(stats: &mut CodexLocalAccessStats) {
     }
     sort_usage_accounts(&mut stats.accounts);
     sort_usage_api_keys(&mut stats.api_keys);
+    for api_key in &mut stats.api_keys {
+        sort_usage_models(&mut api_key.models);
+    }
     recompute_time_windows(stats, now);
 }
 
@@ -3715,6 +3737,31 @@ fn apply_usage_stats(
     }
 }
 
+fn upsert_model_usage_stats(
+    models: &mut Vec<CodexLocalAccessModelStats>,
+    model_id: Option<&str>,
+    success: bool,
+    latency_ms: u64,
+    usage: Option<&UsageCapture>,
+    updated_at: i64,
+) {
+    let model_id = normalize_usage_model_id(model_id);
+
+    if let Some(model_stats) = models.iter_mut().find(|item| item.model_id == model_id) {
+        model_stats.updated_at = updated_at;
+        apply_usage_stats(&mut model_stats.usage, success, latency_ms, usage);
+        return;
+    }
+
+    let mut model_stats = CodexLocalAccessModelStats {
+        model_id,
+        usage: CodexLocalAccessUsageStats::default(),
+        updated_at,
+    };
+    apply_usage_stats(&mut model_stats.usage, success, latency_ms, usage);
+    models.push(model_stats);
+}
+
 fn upsert_account_usage_stats(
     accounts: &mut Vec<CodexLocalAccessAccountStats>,
     account_id: Option<&str>,
@@ -3780,6 +3827,7 @@ fn upsert_api_key_usage_stats(
     latency_ms: u64,
     usage: Option<&UsageCapture>,
     updated_at: i64,
+    model_id: Option<&str>,
 ) {
     let Some(api_key_id) = api_key_id.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
@@ -3797,6 +3845,14 @@ fn upsert_api_key_usage_stats(
         api_key_stats.api_key_name = normalized_name;
         api_key_stats.updated_at = updated_at;
         apply_usage_stats(&mut api_key_stats.usage, success, latency_ms, usage);
+        upsert_model_usage_stats(
+            &mut api_key_stats.models,
+            model_id,
+            success,
+            latency_ms,
+            usage,
+            updated_at,
+        );
         return;
     }
 
@@ -3804,9 +3860,18 @@ fn upsert_api_key_usage_stats(
         api_key_id: api_key_id.to_string(),
         api_key_name: normalized_name,
         usage: CodexLocalAccessUsageStats::default(),
+        models: Vec::new(),
         updated_at,
     };
     apply_usage_stats(&mut api_key_stats.usage, success, latency_ms, usage);
+    upsert_model_usage_stats(
+        &mut api_key_stats.models,
+        model_id,
+        success,
+        latency_ms,
+        usage,
+        updated_at,
+    );
     api_keys.push(api_key_stats);
 }
 
@@ -3848,6 +3913,7 @@ async fn record_request_stats(
             latency_ms,
             usage_ref,
             now,
+            model_id,
         );
         append_usage_event(
             &mut runtime.stats.events,
@@ -7527,7 +7593,261 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
         assert_eq!(stats.monthly.api_keys[0].api_key_id, "key-a");
         assert_eq!(stats.monthly.api_keys[0].api_key_name, "Alice");
         assert_eq!(stats.monthly.api_keys[0].usage.output_tokens, 3);
+        assert_eq!(stats.monthly.models.len(), 1);
+        assert_eq!(stats.monthly.models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(stats.monthly.models[0].usage.request_count, 1);
+        assert_eq!(stats.monthly.models[0].usage.total_tokens, 10);
+        assert_eq!(stats.monthly.models[0].usage.cached_tokens, 2);
+        assert_eq!(stats.monthly.models[0].usage.reasoning_tokens, 1);
+        assert_eq!(stats.monthly.api_keys[0].models.len(), 1);
+        assert_eq!(stats.monthly.api_keys[0].models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(stats.monthly.api_keys[0].models[0].usage.output_tokens, 3);
         assert_eq!(stats.events[0].model_id, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn usage_windows_group_models_per_total_and_api_key() {
+        let mut stats = empty_stats_snapshot();
+        let now = stats.updated_at.saturating_add(1);
+        let usage_a = UsageCapture {
+            input_tokens: 20,
+            output_tokens: 5,
+            total_tokens: 25,
+            cached_tokens: 4,
+            reasoning_tokens: 1,
+        };
+        let usage_b = UsageCapture {
+            input_tokens: 3,
+            output_tokens: 7,
+            total_tokens: 10,
+            cached_tokens: 0,
+            reasoning_tokens: 2,
+        };
+
+        append_usage_event(
+            &mut stats.events,
+            now,
+            Some("gpt-5.4-mini"),
+            Some("acc-a"),
+            Some("a@example.com"),
+            None,
+            Some("key-a"),
+            Some("Alice"),
+            true,
+            10,
+            Some(&usage_a),
+        );
+        append_usage_event(
+            &mut stats.events,
+            now + 1,
+            Some("gpt-5.4-mini"),
+            Some("acc-b"),
+            Some("b@example.com"),
+            None,
+            Some("key-b"),
+            Some("Bob"),
+            true,
+            11,
+            Some(&usage_b),
+        );
+        append_usage_event(
+            &mut stats.events,
+            now + 2,
+            Some("gpt-5.2"),
+            Some("acc-a"),
+            Some("a@example.com"),
+            None,
+            Some("key-a"),
+            Some("Alice"),
+            false,
+            12,
+            Some(&usage_b),
+        );
+
+        recompute_time_windows(&mut stats, now + 2);
+
+        assert_eq!(stats.monthly.models.len(), 2);
+        let mini = stats
+            .monthly
+            .models
+            .iter()
+            .find(|item| item.model_id == "gpt-5.4-mini")
+            .expect("expected gpt-5.4-mini model stats");
+        assert_eq!(mini.usage.request_count, 2);
+        assert_eq!(mini.usage.success_count, 2);
+        assert_eq!(mini.usage.total_tokens, 35);
+        assert_eq!(mini.usage.cached_tokens, 4);
+        assert_eq!(mini.usage.reasoning_tokens, 3);
+
+        let codex = stats
+            .monthly
+            .models
+            .iter()
+            .find(|item| item.model_id == "gpt-5.2")
+            .expect("expected gpt-5.2 model stats");
+        assert_eq!(codex.usage.request_count, 1);
+        assert_eq!(codex.usage.failure_count, 1);
+        assert_eq!(codex.usage.total_tokens, 10);
+
+        let key_a = stats
+            .monthly
+            .api_keys
+            .iter()
+            .find(|item| item.api_key_id == "key-a")
+            .expect("expected key-a stats");
+        assert_eq!(key_a.models.len(), 2);
+        assert_eq!(
+            key_a
+                .models
+                .iter()
+                .find(|item| item.model_id == "gpt-5.4-mini")
+                .expect("expected key-a mini model")
+                .usage
+                .total_tokens,
+            25
+        );
+        assert_eq!(
+            key_a
+                .models
+                .iter()
+                .find(|item| item.model_id == "gpt-5.2")
+                .expect("expected key-a gpt-5.2 model")
+                .usage
+                .failure_count,
+            1
+        );
+
+        let key_b = stats
+            .monthly
+            .api_keys
+            .iter()
+            .find(|item| item.api_key_id == "key-b")
+            .expect("expected key-b stats");
+        assert_eq!(key_b.models.len(), 1);
+        assert_eq!(key_b.models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(key_b.models[0].usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn usage_windows_group_blank_model_as_unknown() {
+        let mut stats = empty_stats_snapshot();
+        let now = stats.updated_at.saturating_add(1);
+        let usage = UsageCapture {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+        };
+
+        append_usage_event(
+            &mut stats.events,
+            now,
+            Some("   "),
+            Some("acc-a"),
+            Some("a@example.com"),
+            None,
+            Some("key-a"),
+            Some("Alice"),
+            true,
+            1,
+            Some(&usage),
+        );
+        recompute_time_windows(&mut stats, now);
+
+        assert_eq!(stats.monthly.models.len(), 1);
+        assert_eq!(stats.monthly.models[0].model_id, "unknown");
+        assert_eq!(stats.monthly.models[0].usage.total_tokens, 3);
+        assert_eq!(stats.monthly.api_keys[0].models[0].model_id, "unknown");
+    }
+
+    #[test]
+    fn old_stats_without_model_breakdowns_deserialize_and_recompute() {
+        let now = empty_stats_snapshot().updated_at.saturating_add(1);
+        let payload = json!({
+            "since": now - 1_000,
+            "updatedAt": now,
+            "totals": {
+                "requestCount": 1,
+                "successCount": 1,
+                "failureCount": 0,
+                "totalLatencyMs": 5,
+                "inputTokens": 4,
+                "outputTokens": 6,
+                "totalTokens": 10,
+                "cachedTokens": 1,
+                "reasoningTokens": 2
+            },
+            "accounts": [],
+            "apiKeys": [{
+                "apiKeyId": "key-a",
+                "apiKeyName": "Alice",
+                "usage": {
+                    "requestCount": 1,
+                    "successCount": 1,
+                    "failureCount": 0,
+                    "totalLatencyMs": 5,
+                    "inputTokens": 4,
+                    "outputTokens": 6,
+                    "totalTokens": 10,
+                    "cachedTokens": 1,
+                    "reasoningTokens": 2
+                },
+                "updatedAt": now
+            }],
+            "daily": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "weekly": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "monthly": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "events": [{
+                "timestamp": now,
+                "modelId": "gpt-5.4-mini",
+                "accountId": "acc-a",
+                "email": "a@example.com",
+                "apiKeyId": "key-a",
+                "apiKeyName": "Alice",
+                "success": true,
+                "latencyMs": 5,
+                "inputTokens": 4,
+                "outputTokens": 6,
+                "totalTokens": 10,
+                "cachedTokens": 1,
+                "reasoningTokens": 2
+            }]
+        });
+
+        let mut stats = serde_json::from_value::<
+            crate::models::codex_local_access::CodexLocalAccessStats,
+        >(payload)
+        .expect("old stats payload should deserialize");
+
+        assert!(stats.api_keys[0].models.is_empty());
+        assert!(stats.monthly.models.is_empty());
+
+        recompute_time_windows(&mut stats, now);
+
+        assert_eq!(stats.monthly.models.len(), 1);
+        assert_eq!(stats.monthly.models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(stats.monthly.models[0].usage.total_tokens, 10);
+        assert_eq!(stats.monthly.api_keys[0].models.len(), 1);
+        assert_eq!(stats.monthly.api_keys[0].models[0].model_id, "gpt-5.4-mini");
     }
 
     #[test]

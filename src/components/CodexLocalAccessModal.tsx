@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Check,
+  ChevronDown,
+  ChevronRight,
   CircleAlert,
   Copy,
   DollarSign,
@@ -30,6 +32,7 @@ import type {
   CodexLocalAccessApiKey,
   CodexLocalAccessRoutingStrategy,
   CodexLocalAccessState,
+  CodexLocalAccessModelStats,
   CodexLocalAccessStatsWindow,
   CodexLocalAccessUsageEvent,
   CodexLocalAccessUsageStats,
@@ -141,6 +144,7 @@ const CODEX_LOCAL_ACCESS_MODEL_PRICES_STORAGE_KEY =
 const OPENAI_PRICING_SOURCE_URL = 'https://developers.openai.com/api/docs/pricing';
 const TOKEN_PRICE_DENOMINATOR = 1_000_000;
 const LEGACY_UNKNOWN_MODEL_PRICE_ID = 'unknown';
+const MODEL_STATS_COLLAPSED_LIMIT = 8;
 
 const DEFAULT_MODEL_PRICES: CodexModelPrice[] = [
   { modelId: LEGACY_UNKNOWN_MODEL_PRICE_ID, inputUsdPerMillion: 5, cachedInputUsdPerMillion: 0.5, outputUsdPerMillion: 30, source: 'builtin', updatedAt: 0 },
@@ -402,6 +406,54 @@ function estimateUsageStatsCost(
   );
 }
 
+function mergeCostEstimates(estimates: CostEstimate[]): CostEstimate {
+  const unknownModels = new Set<string>();
+  const usd = estimates.reduce((total, estimate) => {
+    estimate.unknownModelIds.forEach((modelId) => unknownModels.add(modelId));
+    return total + estimate.usd;
+  }, 0);
+  return {
+    usd,
+    unknownModelIds: Array.from(unknownModels).sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+function estimateModelStatsCost(
+  modelStats: CodexLocalAccessModelStats,
+  pricesByModelId: Map<string, CodexModelPrice>,
+): CostEstimate {
+  return estimateUsageStatsCost(
+    modelStats.usage,
+    pricesByModelId,
+    modelStats.modelId?.trim() || LEGACY_UNKNOWN_MODEL_PRICE_ID,
+  );
+}
+
+function estimateModelStatsListCost(
+  models: CodexLocalAccessModelStats[] | undefined,
+  pricesByModelId: Map<string, CodexModelPrice>,
+  fallbackUsage?: CodexLocalAccessUsageStats,
+): CostEstimate {
+  if (models && models.length > 0) {
+    return mergeCostEstimates(
+      models.map((modelStats) => estimateModelStatsCost(modelStats, pricesByModelId)),
+    );
+  }
+  return estimateUsageStatsCost(fallbackUsage, pricesByModelId);
+}
+
+function sortModelStats(models: CodexLocalAccessModelStats[]): CodexLocalAccessModelStats[] {
+  return [...models].sort((left, right) => {
+    const tokenDelta = (right.usage?.totalTokens ?? 0) - (left.usage?.totalTokens ?? 0);
+    if (tokenDelta !== 0) return tokenDelta;
+    const requestDelta = (right.usage?.requestCount ?? 0) - (left.usage?.requestCount ?? 0);
+    if (requestDelta !== 0) return requestDelta;
+    const updatedDelta = (right.updatedAt ?? 0) - (left.updatedAt ?? 0);
+    if (updatedDelta !== 0) return updatedDelta;
+    return (left.modelId || '').localeCompare(right.modelId || '');
+  });
+}
+
 function formatCompactNumber(value: number): string {
   return new Intl.NumberFormat('en', {
     notation: value >= 1000 ? 'compact' : 'standard',
@@ -556,6 +608,10 @@ export function CodexLocalAccessModal({
   const [modelPrices, setModelPrices] = useState<CodexModelPrice[]>(() => readStoredModelPrices());
   const [pricingSyncing, setPricingSyncing] = useState(false);
   const [pricingError, setPricingError] = useState('');
+  const [totalModelsExpanded, setTotalModelsExpanded] = useState(false);
+  const [showAllTotalModels, setShowAllTotalModels] = useState(false);
+  const [expandedApiKeyModelIds, setExpandedApiKeyModelIds] = useState<Set<string>>(new Set());
+  const [showAllApiKeyModelIds, setShowAllApiKeyModelIds] = useState<Set<string>>(new Set());
   const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -587,6 +643,7 @@ export function CodexLocalAccessModal({
     return stats[statsRange];
   }, [stats, statsRange]);
   const selectedTotals = selectedStatsWindow?.totals;
+  const selectedModelStats = selectedStatsWindow?.models ?? [];
   const routingStrategy = collection?.routingStrategy ?? 'auto';
   const modelIdOptions = useMemo(
     () => modelIds.map((modelId) => ({ value: modelId, label: modelId })),
@@ -687,6 +744,10 @@ export function CodexLocalAccessModal({
   useEffect(() => {
     persistModelPrices(modelPrices);
   }, [modelPrices]);
+
+  useEffect(() => {
+    setShowAllTotalModels(false);
+  }, [statsRange]);
 
   const normalizeTag = (value: string) => value.trim().toLowerCase();
 
@@ -980,6 +1041,9 @@ export function CodexLocalAccessModal({
     selectedUsageEvents.forEach((event) => {
       append(event.modelId?.trim() || LEGACY_UNKNOWN_MODEL_PRICE_ID);
     });
+    selectedModelStats.forEach((modelStats) => {
+      append(modelStats.modelId?.trim() || LEGACY_UNKNOWN_MODEL_PRICE_ID);
+    });
     if ((selectedTotals?.totalTokens ?? 0) > 0) {
       append(LEGACY_UNKNOWN_MODEL_PRICE_ID);
     }
@@ -992,9 +1056,23 @@ export function CodexLocalAccessModal({
     return rows.sort((left, right) =>
       normalizeModelPriceId(left.modelId).localeCompare(normalizeModelPriceId(right.modelId)),
     );
-  }, [modelIds, modelPrices, pricesByModelId, selectedTotals?.totalTokens, selectedUsageEvents]);
+  }, [
+    modelIds,
+    modelPrices,
+    pricesByModelId,
+    selectedModelStats,
+    selectedTotals?.totalTokens,
+    selectedUsageEvents,
+  ]);
 
   const costByApiKeyId = useMemo(() => {
+    const next = new Map<string, CostEstimate>();
+    selectedStatsWindow?.apiKeys.forEach((apiKeyStats) => {
+      next.set(
+        apiKeyStats.apiKeyId,
+        estimateModelStatsListCost(apiKeyStats.models, pricesByModelId, apiKeyStats.usage),
+      );
+    });
     const grouped = new Map<string, CodexLocalAccessUsageEvent[]>();
     selectedUsageEvents.forEach((event) => {
       if (!event.apiKeyId) return;
@@ -1002,10 +1080,13 @@ export function CodexLocalAccessModal({
       current.push(event);
       grouped.set(event.apiKeyId, current);
     });
-    const next = new Map<string, CostEstimate>();
-    grouped.forEach((events, apiKeyId) => next.set(apiKeyId, estimateEventsCost(events, pricesByModelId)));
+    grouped.forEach((events, apiKeyId) => {
+      if (!next.has(apiKeyId)) {
+        next.set(apiKeyId, estimateEventsCost(events, pricesByModelId));
+      }
+    });
     return next;
-  }, [pricesByModelId, selectedUsageEvents]);
+  }, [pricesByModelId, selectedStatsWindow?.apiKeys, selectedUsageEvents]);
 
   const costByAccountId = useMemo(() => {
     const grouped = new Map<string, CodexLocalAccessUsageEvent[]>();
@@ -1021,11 +1102,14 @@ export function CodexLocalAccessModal({
   }, [pricesByModelId, selectedUsageEvents]);
 
   const selectedTotalCost = useMemo(() => {
+    if (selectedModelStats.length > 0) {
+      return estimateModelStatsListCost(selectedModelStats, pricesByModelId, selectedTotals);
+    }
     if (selectedUsageEvents.length > 0) {
       return estimateEventsCost(selectedUsageEvents, pricesByModelId);
     }
     return estimateUsageStatsCost(selectedTotals, pricesByModelId);
-  }, [pricesByModelId, selectedTotals, selectedUsageEvents]);
+  }, [pricesByModelId, selectedModelStats, selectedTotals, selectedUsageEvents]);
 
   const summaryStats = useMemo(
     () => [
@@ -1159,6 +1243,81 @@ export function CodexLocalAccessModal({
             <span>{line.text}</span>
           </span>
         ))}
+      </div>
+    );
+  };
+
+  const renderModelStatsTable = (
+    models: CodexLocalAccessModelStats[],
+    showAll: boolean,
+    onToggleShowAll: () => void,
+  ) => {
+    const sortedModels = sortModelStats(models);
+    const visibleModels = showAll
+      ? sortedModels
+      : sortedModels.slice(0, MODEL_STATS_COLLAPSED_LIMIT);
+
+    if (sortedModels.length === 0) {
+      return (
+        <div className="codex-local-access-model-stats-empty">
+          {t('codex.localAccess.stats.modelStatsEmpty', '当前范围暂无模型统计')}
+        </div>
+      );
+    }
+
+    return (
+      <div className="codex-local-access-model-stats">
+        <div className="codex-local-access-model-stats-head">
+          <span>{t('codex.localAccess.stats.model', '模型')}</span>
+          <span>{t('codex.localAccess.stats.requestsShort', '请求')}</span>
+          <span>{t('codex.localAccess.stats.totalTokensShort', '总 Token')}</span>
+          <span>{t('codex.localAccess.stats.inputOutputShort', '输入 / 输出')}</span>
+          <span>{t('codex.localAccess.stats.specialTokensShort', '缓存 / 思考')}</span>
+          <span>{t('codex.localAccess.stats.costShort', '费用')}</span>
+        </div>
+        {visibleModels.map((modelStats) => {
+          const usage = modelStats.usage;
+          const cost = estimateModelStatsCost(modelStats, pricesByModelId);
+          const costTitle =
+            cost.unknownModelIds.length > 0
+              ? t('codex.localAccess.pricing.unknownModels', {
+                  models: cost.unknownModelIds.join(', '),
+                  defaultValue: '未配置价格: {{models}}',
+                })
+              : undefined;
+          return (
+            <div key={modelStats.modelId || LEGACY_UNKNOWN_MODEL_PRICE_ID} className="codex-local-access-model-stats-row">
+              <code title={modelStats.modelId || LEGACY_UNKNOWN_MODEL_PRICE_ID}>
+                {modelStats.modelId || LEGACY_UNKNOWN_MODEL_PRICE_ID}
+              </code>
+              <span>{formatCompactNumber(usage?.requestCount ?? 0)}</span>
+              <span>{formatCompactNumber(usage?.totalTokens ?? 0)}</span>
+              <span>
+                {formatCompactNumber(usage?.inputTokens ?? 0)} /{' '}
+                {formatCompactNumber(usage?.outputTokens ?? 0)}
+              </span>
+              <span>
+                {formatCompactNumber(usage?.cachedTokens ?? 0)} /{' '}
+                {formatCompactNumber(usage?.reasoningTokens ?? 0)}
+              </span>
+              <span title={costTitle}>{formatCostEstimate(cost)}</span>
+            </div>
+          );
+        })}
+        {sortedModels.length > MODEL_STATS_COLLAPSED_LIMIT && (
+          <button
+            type="button"
+            className="codex-local-access-model-stats-more"
+            onClick={onToggleShowAll}
+          >
+            {showAll
+              ? t('codex.localAccess.stats.showLessModels', '收起')
+              : t('codex.localAccess.stats.showAllModels', {
+                  count: sortedModels.length,
+                  defaultValue: '显示全部 {{count}} 个模型',
+                })}
+          </button>
+        )}
       </div>
     );
   };
@@ -1817,6 +1976,26 @@ export function CodexLocalAccessModal({
                   </div>
                 ))}
               </div>
+              <div className="codex-local-access-model-stats-panel">
+                <button
+                  type="button"
+                  className="codex-local-access-model-stats-toggle"
+                  onClick={() => setTotalModelsExpanded((current) => !current)}
+                  aria-expanded={totalModelsExpanded}
+                >
+                  {totalModelsExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  <span>
+                    {t('codex.localAccess.stats.modelStatsTitle', {
+                      count: selectedModelStats.length,
+                      defaultValue: '按模型统计 {{count}}',
+                    })}
+                  </span>
+                </button>
+                {totalModelsExpanded &&
+                  renderModelStatsTable(selectedModelStats, showAllTotalModels, () =>
+                    setShowAllTotalModels((current) => !current),
+                  )}
+              </div>
               {currentQuotaPoolSummary.visiblePlans.length > 0 && (
                 <div
                   className="codex-local-access-quota-pool-grid"
@@ -2424,16 +2603,20 @@ export function CodexLocalAccessModal({
                     </div>
                   ) : (
                     apiKeys.map((apiKey) => {
-                      const keyStats = windowStatsByApiKeyId.get(apiKey.id)?.usage;
+                      const windowApiKeyStats = windowStatsByApiKeyId.get(apiKey.id);
+                      const keyStats = windowApiKeyStats?.usage;
+                      const keyModelStats = windowApiKeyStats?.models ?? [];
                       const keyCost =
                         costByApiKeyId.get(apiKey.id) ??
-                        estimateUsageStatsCost(keyStats, pricesByModelId);
+                        estimateModelStatsListCost(keyModelStats, pricesByModelId, keyStats);
                       const monthlyStats = monthlyStatsByApiKeyId.get(apiKey.id)?.usage;
                       const usedTokens = monthlyStats?.totalTokens ?? 0;
                       const limit = apiKey.monthlyTokenLimit;
                       const remaining =
                         limit && limit > 0 ? Math.max(0, limit - usedTokens) : null;
                       const overLimit = Boolean(limit && usedTokens >= limit);
+                      const modelsExpanded = expandedApiKeyModelIds.has(apiKey.id);
+                      const showAllKeyModels = showAllApiKeyModelIds.has(apiKey.id);
 
                       return (
                         <div
@@ -2504,6 +2687,28 @@ export function CodexLocalAccessModal({
                                     defaultValue: '费用 {{cost}}',
                                   })}
                                 </span>
+                                <button
+                                  type="button"
+                                  className="codex-local-access-account-stat-pill codex-local-access-model-pill"
+                                  onClick={() => {
+                                    setExpandedApiKeyModelIds((current) => {
+                                      const next = new Set(current);
+                                      if (next.has(apiKey.id)) {
+                                        next.delete(apiKey.id);
+                                      } else {
+                                        next.add(apiKey.id);
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                  aria-expanded={modelsExpanded}
+                                >
+                                  {modelsExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                  {t('codex.localAccess.stats.modelStatsCompact', {
+                                    count: keyModelStats.length,
+                                    defaultValue: '模型 {{count}}',
+                                  })}
+                                </button>
                                 <span className="codex-local-access-account-stat-pill">
                                   {remaining == null
                                     ? t('codex.localAccess.apiKeyUnlimited', '不限')
@@ -2515,6 +2720,21 @@ export function CodexLocalAccessModal({
                               </div>
                             </div>
                           </div>
+                          {modelsExpanded && (
+                            <div className="codex-local-access-key-model-stats">
+                              {renderModelStatsTable(keyModelStats, showAllKeyModels, () => {
+                                setShowAllApiKeyModelIds((current) => {
+                                  const next = new Set(current);
+                                  if (next.has(apiKey.id)) {
+                                    next.delete(apiKey.id);
+                                  } else {
+                                    next.add(apiKey.id);
+                                  }
+                                  return next;
+                                });
+                              })}
+                            </div>
+                          )}
                         </div>
                       );
                     })

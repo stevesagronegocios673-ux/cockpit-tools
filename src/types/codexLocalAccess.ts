@@ -63,6 +63,13 @@ export interface CodexLocalAccessApiKeyStats {
   apiKeyId: string;
   apiKeyName: string;
   usage: CodexLocalAccessUsageStats;
+  models: CodexLocalAccessModelStats[];
+  updatedAt: number;
+}
+
+export interface CodexLocalAccessModelStats {
+  modelId: string;
+  usage: CodexLocalAccessUsageStats;
   updatedAt: number;
 }
 
@@ -91,6 +98,7 @@ export interface CodexLocalAccessStatsWindow {
   totals: CodexLocalAccessUsageStats;
   accounts: CodexLocalAccessAccountStats[];
   apiKeys: CodexLocalAccessApiKeyStats[];
+  models: CodexLocalAccessModelStats[];
 }
 
 export interface CodexLocalAccessStats {
