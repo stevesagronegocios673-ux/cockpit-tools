@@ -3,6 +3,7 @@ import { createPlatformInstanceService } from "./platform/createPlatformInstance
 import type {
   CodexSessionVisibilityRepairSummary,
   CodexInstanceThreadSyncSummary,
+  CodexInstanceTargetThreadSyncSummary,
   CodexSessionRecord,
   CodexSessionTokenStats,
   CodexSessionTrashSummary,
@@ -129,6 +130,16 @@ export async function executeCodexInstanceLaunchCommand(
 
 export async function syncThreadsAcrossInstances(): Promise<CodexInstanceThreadSyncSummary> {
   return await invoke("codex_sync_threads_across_instances");
+}
+
+export async function syncSessionsToInstance(
+  sessionIds: string[],
+  targetInstanceId: string,
+): Promise<CodexInstanceTargetThreadSyncSummary> {
+  return await invoke("codex_sync_sessions_to_instance", {
+    sessionIds,
+    targetInstanceId,
+  });
 }
 
 export async function repairSessionVisibilityAcrossInstances(): Promise<CodexSessionVisibilityRepairSummary> {

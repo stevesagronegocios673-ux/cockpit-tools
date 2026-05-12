@@ -319,6 +319,14 @@ pub async fn codex_sync_threads_across_instances(
 }
 
 #[tauri::command]
+pub async fn codex_sync_sessions_to_instance(
+    session_ids: Vec<String>,
+    target_instance_id: String,
+) -> Result<modules::codex_thread_sync::CodexInstanceTargetThreadSyncSummary, String> {
+    modules::codex_thread_sync::sync_sessions_to_instance(session_ids, target_instance_id)
+}
+
+#[tauri::command]
 pub async fn codex_repair_session_visibility_across_instances(
 ) -> Result<modules::codex_session_visibility::CodexSessionVisibilityRepairSummary, String> {
     modules::codex_session_visibility::repair_session_visibility_across_instances()

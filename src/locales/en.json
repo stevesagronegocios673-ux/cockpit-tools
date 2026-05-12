@@ -2417,6 +2417,7 @@
       "actions": {
         "moveToTrash": "Move to Trash",
         "syncSessions": "Sync Sessions",
+        "copyToInstance": "Copy to Instance",
         "repairVisibility": "Repair Visibility",
         "restoreSessions": "Restore Sessions",
         "copySessionId": "Copy Session ID",
@@ -2454,6 +2455,15 @@
         "emptyTitle": "Trash is empty",
         "emptyDesc": "Sessions moved to Trash will appear here.",
         "restoreAction": "Restore Selected Sessions"
+      },
+      "targetModal": {
+        "title": "Copy to Instance",
+        "hint": "Copies the selected sessions into the target instance. Sessions with the same ID already present there are skipped. Running target instances may need a restart before they appear.",
+        "targetInstance": "Target instance",
+        "pickTarget": "Select a target instance",
+        "selectedCount": "{{count}} session(s) selected",
+        "existingCount": "{{count}} already in target",
+        "confirm": "Copy Sessions"
       }
     },
     "groups": {

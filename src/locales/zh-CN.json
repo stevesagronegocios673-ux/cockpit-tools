@@ -2417,6 +2417,7 @@
       "actions": {
         "moveToTrash": "移到废纸篓",
         "syncSessions": "同步会话",
+        "copyToInstance": "复制到实例",
         "repairVisibility": "修复可见性",
         "restoreSessions": "恢复会话",
         "copySessionId": "复制会话 ID",
@@ -2454,6 +2455,15 @@
         "emptyTitle": "废纸篓里还没有会话",
         "emptyDesc": "已移到废纸篓的会话会显示在这里。",
         "restoreAction": "恢复选中会话"
+      },
+      "targetModal": {
+        "title": "复制到实例",
+        "hint": "会把所选会话补到目标实例，已有同 ID 会话会自动跳过；目标实例运行中时可能需要重启后显示。",
+        "targetInstance": "目标实例",
+        "pickTarget": "请选择目标实例",
+        "selectedCount": "已选择 {{count}} 条会话",
+        "existingCount": "目标已存在 {{count}} 条",
+        "confirm": "复制会话"
       }
     },
     "groups": {

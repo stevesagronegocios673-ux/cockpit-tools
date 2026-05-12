@@ -789,6 +789,7 @@ pub fn run() {
             commands::codex_instance::codex_save_instance_quick_config,
             commands::codex_instance::codex_open_instance_config_toml,
             commands::codex_instance::codex_sync_threads_across_instances,
+            commands::codex_instance::codex_sync_sessions_to_instance,
             commands::codex_instance::codex_repair_session_visibility_across_instances,
             commands::codex_instance::codex_list_sessions_across_instances,
             commands::codex_instance::codex_get_session_token_stats_across_instances,

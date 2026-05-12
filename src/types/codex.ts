@@ -155,6 +155,18 @@ export interface CodexSessionTokenStats {
   totalTokens: number;
 }
 
+export interface CodexInstanceTargetThreadSyncSummary {
+  requestedSessionCount: number;
+  targetInstanceId: string;
+  targetInstanceName: string;
+  syncedSessionCount: number;
+  skippedExistingCount: number;
+  missingSessionCount: number;
+  backupDir?: string | null;
+  running: boolean;
+  message: string;
+}
+
 export interface CodexSessionTrashSummary {
   requestedSessionCount: number;
   trashedSessionCount: number;
