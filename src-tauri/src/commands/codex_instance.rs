@@ -88,7 +88,7 @@ async fn inject_bound_account_to_profile(
     bind_account_id: &str,
 ) -> Result<(), String> {
     if modules::codex_instance::is_api_service_bind_account_id(bind_account_id) {
-        modules::codex_local_access::activate_local_access_for_dir(profile_dir).await?;
+        modules::codex_local_access::activate_local_access_for_dir(None, profile_dir).await?;
         return Ok(());
     }
 

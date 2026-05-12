@@ -24,6 +24,22 @@
   gap: 20px;
 }
 
+.codex-local-access-overview-panel {
+  margin-bottom: 4px;
+}
+
+.codex-local-access-overview-panel .codex-local-access-overview-card {
+  min-height: auto;
+}
+
+.codex-local-access-overview-panel .codex-local-access-header {
+  align-items: flex-start;
+}
+
+.codex-local-access-overview-panel .codex-local-access-preview {
+  max-width: none;
+}
+
 .codex-overview-selection-bar {
   display: flex;
   flex-wrap: wrap;

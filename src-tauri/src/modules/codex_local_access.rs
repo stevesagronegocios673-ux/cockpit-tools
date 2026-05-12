@@ -1,8 +1,12 @@
 use crate::models::codex::{CodexAccount, CodexApiProviderMode};
 use crate::models::codex_local_access::{
-    CodexLocalAccessAccountStats, CodexLocalAccessCollection, CodexLocalAccessPortCleanupResult,
-    CodexLocalAccessRoutingStrategy, CodexLocalAccessState, CodexLocalAccessStats,
-    CodexLocalAccessStatsWindow, CodexLocalAccessUsageEvent, CodexLocalAccessUsageStats,
+    CodexLocalAccessAccountStats, CodexLocalAccessAlert, CodexLocalAccessApiKey,
+    CodexLocalAccessApiKeyHealth, CodexLocalAccessApiKeyStats, CodexLocalAccessCollection,
+    CodexLocalAccessConfig, CodexLocalAccessDiagnosticEvent, CodexLocalAccessDiagnostics,
+    CodexLocalAccessModelStats, CodexLocalAccessPortCleanupResult, CodexLocalAccessRoutingStrategy,
+    CodexLocalAccessServiceSummary, CodexLocalAccessState, CodexLocalAccessStats,
+    CodexLocalAccessStatsStore, CodexLocalAccessStatsWindow, CodexLocalAccessUpstreamHealth,
+    CodexLocalAccessUpstreamSource, CodexLocalAccessUsageEvent, CodexLocalAccessUsageStats,
 };
 use crate::modules::atomic_write::write_string_atomic;
 use crate::modules::{codex_account, codex_oauth, codex_wakeup, logger, process};
@@ -25,6 +29,8 @@ use tokio::time::{timeout, Duration};
 
 const CODEX_LOCAL_ACCESS_FILE: &str = "codex_local_access.json";
 const CODEX_LOCAL_ACCESS_STATS_FILE: &str = "codex_local_access_stats.json";
+const DEFAULT_LOCAL_ACCESS_SERVICE_ID: &str = "default";
+const DEFAULT_LOCAL_ACCESS_SERVICE_NAME: &str = "API 服务 1";
 const CODEX_LOCAL_ACCESS_BIND_HOST: &str = "0.0.0.0";
 const CODEX_LOCAL_ACCESS_URL_HOST: &str = "127.0.0.1";
 const MAX_HTTP_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -42,11 +48,17 @@ const MAX_RETRY_CREDENTIALS_PER_REQUEST: usize = 8;
 const RESPONSE_AFFINITY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_RESPONSE_AFFINITY_BINDINGS: usize = 4096;
 const PREPARED_ACCOUNT_CACHE_TTL_MS: i64 = 30 * 1000;
+const UPSTREAM_MODELS_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
+const UPSTREAM_MODELS_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 const DAY_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const WEEK_WINDOW_MS: i64 = 7 * DAY_WINDOW_MS;
 const MONTH_WINDOW_MS: i64 = 30 * DAY_WINDOW_MS;
+const MAX_RECENT_USAGE_EVENTS: usize = 5_000;
+const MAX_DIAGNOSTIC_EVENTS: usize = 1_000;
+const DIAGNOSTIC_MESSAGE_MAX_CHARS: usize = 240;
 const GATEWAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const UPSTREAM_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_CODEX_USER_AGENT: &str =
     "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)";
 const DEFAULT_CODEX_ORIGINATOR: &str = "codex-tui";
@@ -72,14 +84,22 @@ const IMAGES_EDITS_PATH: &str = "/v1/images/edits";
 static GATEWAY_RUNTIME: OnceLock<TokioMutex<GatewayRuntime>> = OnceLock::new();
 static GATEWAY_ROUND_ROBIN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static UPSTREAM_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static UPSTREAM_MODELS_CACHE: OnceLock<TokioMutex<HashMap<String, CachedUpstreamModels>>> =
+    OnceLock::new();
 
 #[derive(Default)]
 struct GatewayRuntime {
     loaded: bool,
+    selected_service_id: Option<String>,
+    services: HashMap<String, GatewayServiceRuntime>,
+    stats_flush_inflight: bool,
+}
+
+#[derive(Default)]
+struct GatewayServiceRuntime {
     collection: Option<CodexLocalAccessCollection>,
     stats: CodexLocalAccessStats,
     stats_dirty: bool,
-    stats_flush_inflight: bool,
     response_affinity: HashMap<String, ResponseAffinityBinding>,
     model_cooldowns: HashMap<String, AccountModelCooldown>,
     prepared_accounts: HashMap<String, CachedPreparedAccount>,
@@ -145,11 +165,33 @@ struct CachedPreparedAccount {
     cached_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedUpstreamModels {
+    model_ids: Vec<String>,
+    fetched_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct UpstreamModelsFetchFailure {
+    message: String,
+    status_code: Option<u16>,
+    retryable: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalAccessSourceMetadata {
+    source_type: String,
+    provider_name: Option<String>,
+    base_url_host: Option<String>,
+}
+
 #[derive(Debug)]
 struct ProxyDispatchSuccess {
     upstream: reqwest::Response,
     account_id: String,
     account_email: String,
+    response_adapter: GatewayResponseAdapter,
+    source_metadata: LocalAccessSourceMetadata,
 }
 
 #[derive(Debug)]
@@ -158,6 +200,7 @@ struct ProxyDispatchError {
     message: String,
     account_id: Option<String>,
     account_email: Option<String>,
+    source_metadata: Option<LocalAccessSourceMetadata>,
 }
 
 struct ResponseUsageCollector {
@@ -168,7 +211,7 @@ struct ResponseUsageCollector {
     response_id: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedRequest {
     method: String,
     target: String,
@@ -215,6 +258,10 @@ fn upstream_http_client() -> &'static Client {
     UPSTREAM_HTTP_CLIENT.get_or_init(Client::new)
 }
 
+fn upstream_models_cache() -> &'static TokioMutex<HashMap<String, CachedUpstreamModels>> {
+    UPSTREAM_MODELS_CACHE.get_or_init(|| TokioMutex::new(HashMap::new()))
+}
+
 fn local_access_file_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot find home directory")?;
     Ok(home
@@ -238,7 +285,7 @@ fn is_prepared_account_cache_valid(entry: &CachedPreparedAccount, now: i64) -> b
         && !codex_oauth::is_token_expired(&entry.account.tokens.access_token)
 }
 
-fn prune_prepared_account_cache(runtime: &mut GatewayRuntime, now: i64) {
+fn prune_prepared_account_cache(runtime: &mut GatewayServiceRuntime, now: i64) {
     let allowed_account_ids = runtime.collection.as_ref().map(|collection| {
         collection
             .account_ids
@@ -256,18 +303,23 @@ fn prune_prepared_account_cache(runtime: &mut GatewayRuntime, now: i64) {
     });
 }
 
-fn sync_runtime_collection(runtime: &mut GatewayRuntime, collection: CodexLocalAccessCollection) {
+fn sync_runtime_collection(
+    runtime: &mut GatewayServiceRuntime,
+    collection: CodexLocalAccessCollection,
+) {
     runtime.collection = Some(collection);
-    runtime.loaded = true;
     runtime.last_error = None;
     prune_prepared_account_cache(runtime, now_ms());
 }
 
-async fn cache_prepared_account(account: &CodexAccount) {
+async fn cache_prepared_account(service_id: &str, account: &CodexAccount) {
     let mut runtime = gateway_runtime().lock().await;
+    let Some(service) = runtime.services.get_mut(service_id) else {
+        return;
+    };
     let now = now_ms();
-    prune_prepared_account_cache(&mut runtime, now);
-    runtime.prepared_accounts.insert(
+    prune_prepared_account_cache(service, now);
+    service.prepared_accounts.insert(
         account.id.clone(),
         CachedPreparedAccount {
             account: account.clone(),
@@ -276,30 +328,37 @@ async fn cache_prepared_account(account: &CodexAccount) {
     );
 }
 
-async fn invalidate_prepared_account(account_id: &str) {
+async fn invalidate_prepared_account(service_id: &str, account_id: &str) {
     let mut runtime = gateway_runtime().lock().await;
-    runtime.prepared_accounts.remove(account_id);
+    if let Some(service) = runtime.services.get_mut(service_id) {
+        service.prepared_accounts.remove(account_id);
+    }
 }
 
-fn try_get_cached_account_for_routing(account_id: &str) -> Option<CodexAccount> {
+fn try_get_cached_account_for_routing(service_id: &str, account_id: &str) -> Option<CodexAccount> {
     let Ok(mut runtime) = gateway_runtime().try_lock() else {
         return None;
     };
+    let service = runtime.services.get_mut(service_id)?;
     let now = now_ms();
-    prune_prepared_account_cache(&mut runtime, now);
-    runtime
+    prune_prepared_account_cache(service, now);
+    service
         .prepared_accounts
         .get(account_id)
         .filter(|entry| is_prepared_account_cache_valid(entry, now))
         .map(|entry| entry.account.clone())
 }
 
-async fn get_prepared_account(account_id: &str) -> Result<CodexAccount, String> {
+async fn get_prepared_account(service_id: &str, account_id: &str) -> Result<CodexAccount, String> {
     {
         let mut runtime = gateway_runtime().lock().await;
+        let service = runtime
+            .services
+            .get_mut(service_id)
+            .ok_or_else(|| "API 服务不存在".to_string())?;
         let now = now_ms();
-        prune_prepared_account_cache(&mut runtime, now);
-        if let Some(entry) = runtime.prepared_accounts.get(account_id) {
+        prune_prepared_account_cache(service, now);
+        if let Some(entry) = service.prepared_accounts.get(account_id) {
             if is_prepared_account_cache_valid(entry, now) {
                 return Ok(entry.account.clone());
             }
@@ -307,7 +366,7 @@ async fn get_prepared_account(account_id: &str) -> Result<CodexAccount, String> 
     }
 
     let account = codex_account::prepare_account_for_injection(account_id).await?;
-    cache_prepared_account(&account).await;
+    cache_prepared_account(service_id, &account).await;
     Ok(account)
 }
 
@@ -332,21 +391,29 @@ async fn schedule_stats_flush_if_needed() {
 
             let stats_snapshot = {
                 let mut runtime = gateway_runtime().lock().await;
-                if !runtime.stats_dirty {
+                if !runtime.services.values().any(|service| service.stats_dirty) {
                     runtime.stats_flush_inflight = false;
                     return;
                 }
-                runtime.stats_dirty = false;
-                runtime.stats.clone()
+                let mut stats_by_service_id = HashMap::new();
+                for (service_id, service) in runtime.services.iter_mut() {
+                    service.stats_dirty = false;
+                    stats_by_service_id.insert(service_id.clone(), service.stats.clone());
+                }
+                CodexLocalAccessStatsStore {
+                    stats_by_service_id,
+                }
             };
 
-            if let Err(err) = save_stats_to_disk(&stats_snapshot) {
+            if let Err(err) = save_stats_store_to_disk(&stats_snapshot) {
                 logger::log_codex_api_warn(&format!(
                     "[CodexLocalAccess] 后台写入请求统计失败: {}",
                     err
                 ));
                 let mut runtime = gateway_runtime().lock().await;
-                runtime.stats_dirty = true;
+                for service in runtime.services.values_mut() {
+                    service.stats_dirty = true;
+                }
                 runtime.stats_flush_inflight = false;
                 return;
             }
@@ -404,23 +471,34 @@ fn supported_codex_model_ids() -> Vec<String> {
     model_ids
 }
 
-fn resolve_supported_model_alias(model: &str) -> String {
+fn resolve_supported_codex_model_alias(model: &str) -> Option<String> {
     let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let normalized = trimmed.to_ascii_lowercase();
 
     for alias in supported_codex_model_ids() {
         if normalized == alias {
-            return alias;
+            return Some(alias);
         }
 
         if let Some(suffix) = normalized.strip_prefix(&alias) {
             if has_date_snapshot_suffix(suffix) {
-                return alias;
+                return Some(alias);
             }
         }
     }
 
-    trimmed.to_string()
+    None
+}
+
+fn is_supported_codex_model_id(model: &str) -> bool {
+    resolve_supported_codex_model_alias(model).is_some()
+}
+
+fn resolve_supported_model_alias(model: &str) -> String {
+    resolve_supported_codex_model_alias(model).unwrap_or_else(|| model.trim().to_string())
 }
 
 fn rewrite_request_model_alias(body: &[u8]) -> Result<Option<Vec<u8>>, String> {
@@ -1017,13 +1095,21 @@ fn build_request_routing_hint(request: &ParsedRequest) -> RequestRoutingHint {
     }
 }
 
+fn extract_request_model_id(request: &ParsedRequest) -> String {
+    parse_request_body_json(&request.body)
+        .and_then(|body| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(resolve_supported_model_alias)
+        })
+        .unwrap_or_default()
+}
+
 fn is_chat_completions_request(target: &str) -> bool {
     let path = target.split('?').next().unwrap_or(target).trim();
     path == CHAT_COMPLETIONS_PATH || path.ends_with("/chat/completions")
-}
-
-fn is_responses_completion_event(event_type: &str) -> bool {
-    matches!(event_type, "response.completed" | "response.done")
 }
 
 fn response_text_type_for_role(role: &str) -> &'static str {
@@ -1977,17 +2063,9 @@ impl ChatCompletionStreamTransformer {
         }
 
         let text = String::from_utf8_lossy(frame);
-        let mut event_name: Option<String> = None;
         let mut data_lines = Vec::new();
         for raw_line in text.lines() {
             let line = raw_line.trim();
-            if let Some(rest) = line.strip_prefix("event:") {
-                let value = rest.trim();
-                if !value.is_empty() {
-                    event_name = Some(value.to_string());
-                }
-                continue;
-            }
             if let Some(rest) = line.strip_prefix("data:") {
                 let payload = rest.trim();
                 if !payload.is_empty() {
@@ -2021,11 +2099,7 @@ impl ChatCompletionStreamTransformer {
             self.response_capture.response_id = extract_response_id(&event);
         }
 
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .or(event_name.as_deref())
-            .unwrap_or("");
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
 
         if event_type == "response.created" {
             if let Some(response) = event.get("response").and_then(Value::as_object) {
@@ -2167,7 +2241,7 @@ impl ChatCompletionStreamTransformer {
                 }]);
                 push_sse_payload(stream_body, template);
             }
-            event_type if is_responses_completion_event(event_type) => {
+            "response.completed" => {
                 let finish_reason = if self.state.function_call_index >= 0 {
                     "tool_calls"
                 } else {
@@ -2398,11 +2472,14 @@ fn resolve_subscription_expiry_ms(account: &CodexAccount) -> Option<i64> {
         .map(|parsed| parsed.timestamp_millis())
 }
 
-fn build_routing_candidates(ordered_account_ids: &[String]) -> Vec<RoutingCandidate> {
+fn build_routing_candidates(
+    service_id: &str,
+    ordered_account_ids: &[String],
+) -> Vec<RoutingCandidate> {
     ordered_account_ids
         .iter()
         .map(|account_id| {
-            let account = try_get_cached_account_for_routing(account_id)
+            let account = try_get_cached_account_for_routing(service_id, account_id)
                 .or_else(|| codex_account::load_account(account_id));
             RoutingCandidate {
                 account_id: account_id.clone(),
@@ -2483,6 +2560,7 @@ fn compare_routing_candidates(
 }
 
 fn apply_routing_strategy(
+    service_id: &str,
     account_ids: &[String],
     strategy: CodexLocalAccessRoutingStrategy,
 ) -> Vec<String> {
@@ -2491,7 +2569,7 @@ fn apply_routing_strategy(
         .enumerate()
         .map(|(index, account_id)| (account_id.clone(), index))
         .collect();
-    let mut candidates = build_routing_candidates(account_ids);
+    let mut candidates = build_routing_candidates(service_id, account_ids);
     candidates
         .sort_by(|left, right| compare_routing_candidates(left, right, strategy, &original_index));
     candidates
@@ -2583,25 +2661,13 @@ fn empty_stats_snapshot() -> CodexLocalAccessStats {
         updated_at: now,
         totals: CodexLocalAccessUsageStats::default(),
         accounts: Vec::new(),
-        daily: CodexLocalAccessStatsWindow {
-            since: day_since,
-            updated_at: now,
-            totals: CodexLocalAccessUsageStats::default(),
-            accounts: Vec::new(),
-        },
-        weekly: CodexLocalAccessStatsWindow {
-            since: week_since,
-            updated_at: now,
-            totals: CodexLocalAccessUsageStats::default(),
-            accounts: Vec::new(),
-        },
-        monthly: CodexLocalAccessStatsWindow {
-            since: month_since,
-            updated_at: now,
-            totals: CodexLocalAccessUsageStats::default(),
-            accounts: Vec::new(),
-        },
+        api_keys: Vec::new(),
+        daily: empty_stats_window(day_since, now),
+        weekly: empty_stats_window(week_since, now),
+        monthly: empty_stats_window(month_since, now),
         events: Vec::new(),
+        upstream_health: Vec::new(),
+        diagnostic_events: Vec::new(),
     }
 }
 
@@ -2611,6 +2677,8 @@ fn empty_stats_window(since: i64, updated_at: i64) -> CodexLocalAccessStatsWindo
         updated_at,
         totals: CodexLocalAccessUsageStats::default(),
         accounts: Vec::new(),
+        api_keys: Vec::new(),
+        models: Vec::new(),
     }
 }
 
@@ -2625,16 +2693,221 @@ fn sort_usage_accounts(accounts: &mut [CodexLocalAccessAccountStats]) {
     });
 }
 
+fn sort_usage_api_keys(api_keys: &mut [CodexLocalAccessApiKeyStats]) {
+    api_keys.sort_by(|left, right| {
+        right
+            .usage
+            .request_count
+            .cmp(&left.usage.request_count)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.api_key_id.cmp(&right.api_key_id))
+    });
+}
+
+fn sort_usage_models(models: &mut [CodexLocalAccessModelStats]) {
+    models.sort_by(|left, right| {
+        right
+            .usage
+            .total_tokens
+            .cmp(&left.usage.total_tokens)
+            .then_with(|| right.usage.request_count.cmp(&left.usage.request_count))
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+}
+
+fn sort_window_usage_breakdowns(window: &mut CodexLocalAccessStatsWindow) {
+    sort_usage_accounts(&mut window.accounts);
+    sort_usage_api_keys(&mut window.api_keys);
+    sort_usage_models(&mut window.models);
+    for api_key in &mut window.api_keys {
+        sort_usage_models(&mut api_key.models);
+    }
+}
+
+fn normalize_usage_model_id(model_id: Option<&str>) -> String {
+    model_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 fn trim_recent_events(events: &mut Vec<CodexLocalAccessUsageEvent>, month_since: i64) {
     events.retain(|event| event.timestamp > 0 && event.timestamp >= month_since);
     events.sort_by_key(|event| event.timestamp);
+    if events.len() > MAX_RECENT_USAGE_EVENTS {
+        let remove = events.len().saturating_sub(MAX_RECENT_USAGE_EVENTS);
+        events.drain(0..remove);
+    }
+}
+
+fn sanitize_diagnostic_message(message: &str) -> String {
+    let compact = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut sanitized_parts = Vec::new();
+    let mut redact_next = false;
+    for part in compact.split(' ') {
+        let lower = part.to_ascii_lowercase();
+        let redacts_following_value = lower.contains("authorization")
+            || lower.contains("x-api-key")
+            || lower.contains("bearer");
+        let sensitive = redacts_following_value
+            || lower.contains("sk-")
+            || lower.contains("agt_codex_")
+            || redact_next;
+        sanitized_parts.push(if sensitive { "[redacted]" } else { part });
+        redact_next = redacts_following_value;
+    }
+    let sanitized = sanitized_parts.join(" ");
+    let trimmed = sanitized.trim();
+    let normalized = if trimmed.is_empty() {
+        "无诊断摘要"
+    } else {
+        trimmed
+    };
+    if normalized.chars().count() <= DIAGNOSTIC_MESSAGE_MAX_CHARS {
+        return normalized.to_string();
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(DIAGNOSTIC_MESSAGE_MAX_CHARS.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn trim_diagnostic_events(events: &mut Vec<CodexLocalAccessDiagnosticEvent>, month_since: i64) {
+    events.retain(|event| event.timestamp > 0 && event.timestamp >= month_since);
+    events.sort_by_key(|event| event.timestamp);
+    if events.len() > MAX_DIAGNOSTIC_EVENTS {
+        let remove = events.len().saturating_sub(MAX_DIAGNOSTIC_EVENTS);
+        events.drain(0..remove);
+    }
+}
+
+fn normalize_optional_diagnostic_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn append_diagnostic_event(
+    stats: &mut CodexLocalAccessStats,
+    now: i64,
+    severity: &str,
+    category: &str,
+    api_key_id: Option<&str>,
+    account_id: Option<&str>,
+    model_id: Option<&str>,
+    status_code: Option<u16>,
+    base_url_host: Option<&str>,
+    message: &str,
+    retryable: bool,
+) {
+    stats
+        .diagnostic_events
+        .push(CodexLocalAccessDiagnosticEvent {
+            timestamp: now,
+            severity: severity.trim().to_string(),
+            category: category.trim().to_string(),
+            api_key_id: normalize_optional_diagnostic_value(api_key_id),
+            account_id: normalize_optional_diagnostic_value(account_id),
+            model_id: normalize_optional_diagnostic_value(model_id),
+            status_code,
+            base_url_host: normalize_optional_diagnostic_value(base_url_host),
+            message: sanitize_diagnostic_message(message),
+            retryable,
+        });
+    trim_diagnostic_events(
+        &mut stats.diagnostic_events,
+        now.saturating_sub(MONTH_WINDOW_MS),
+    );
+}
+
+fn upsert_upstream_health_sample(
+    upstreams: &mut Vec<CodexLocalAccessUpstreamHealth>,
+    account_id: Option<&str>,
+    account_email: Option<&str>,
+    source_metadata: Option<&LocalAccessSourceMetadata>,
+    success: bool,
+    latency_ms: u64,
+    failure_reason: Option<&str>,
+    now: i64,
+) {
+    let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let normalized_email = account_email
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let metadata = source_metadata.cloned().unwrap_or_default();
+    let failure_reason = failure_reason.map(sanitize_diagnostic_message);
+
+    let health = if let Some(existing) = upstreams
+        .iter_mut()
+        .find(|item| item.account_id == account_id)
+    {
+        existing
+    } else {
+        upstreams.push(CodexLocalAccessUpstreamHealth {
+            account_id: account_id.to_string(),
+            healthy: true,
+            ..CodexLocalAccessUpstreamHealth::default()
+        });
+        upstreams
+            .last_mut()
+            .expect("just pushed upstream health record")
+    };
+
+    if !normalized_email.is_empty() {
+        health.email = normalized_email;
+    }
+    if !metadata.source_type.trim().is_empty() {
+        health.source_type = metadata.source_type;
+    }
+    if metadata.provider_name.is_some() {
+        health.provider_name = metadata.provider_name;
+    }
+    if metadata.base_url_host.is_some() {
+        health.base_url_host = metadata.base_url_host;
+    }
+    if latency_ms > 0 {
+        health.average_latency_ms = if health.average_latency_ms == 0 {
+            latency_ms
+        } else {
+            health
+                .average_latency_ms
+                .saturating_mul(3)
+                .saturating_add(latency_ms)
+                / 4
+        };
+    }
+    if success {
+        health.healthy = true;
+        health.consecutive_failures = 0;
+        health.last_success_at = Some(now);
+    } else {
+        health.healthy = false;
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.last_failure_at = Some(now);
+        if let Some(reason) = failure_reason {
+            health.last_failure_reason = Some(reason);
+        }
+    }
 }
 
 fn append_usage_event(
     events: &mut Vec<CodexLocalAccessUsageEvent>,
     now: i64,
+    model_id: Option<&str>,
     account_id: Option<&str>,
     account_email: Option<&str>,
+    source_metadata: Option<&LocalAccessSourceMetadata>,
+    api_key_id: Option<&str>,
+    api_key_name: Option<&str>,
     success: bool,
     latency_ms: u64,
     usage: Option<&UsageCapture>,
@@ -2642,8 +2915,16 @@ fn append_usage_event(
     let usage = usage.cloned().unwrap_or_default();
     events.push(CodexLocalAccessUsageEvent {
         timestamp: now,
+        model_id: model_id.unwrap_or_default().trim().to_string(),
         account_id: account_id.unwrap_or_default().trim().to_string(),
         email: account_email.unwrap_or_default().trim().to_string(),
+        source_type: source_metadata
+            .map(|metadata| metadata.source_type.clone())
+            .filter(|value| !value.trim().is_empty()),
+        provider_name: source_metadata.and_then(|metadata| metadata.provider_name.clone()),
+        base_url_host: source_metadata.and_then(|metadata| metadata.base_url_host.clone()),
+        api_key_id: api_key_id.unwrap_or_default().trim().to_string(),
+        api_key_name: api_key_name.unwrap_or_default().trim().to_string(),
         success,
         latency_ms,
         input_tokens: usage.input_tokens,
@@ -2671,14 +2952,38 @@ fn apply_usage_event_to_window(
         event.latency_ms,
         Some(&usage),
     );
-    upsert_account_usage_stats(
-        &mut window.accounts,
-        Some(event.account_id.as_str()),
-        Some(event.email.as_str()),
+    upsert_model_usage_stats(
+        &mut window.models,
+        Some(event.model_id.as_str()),
         event.success,
         event.latency_ms,
         Some(&usage),
         event.timestamp,
+    );
+    let source_metadata = LocalAccessSourceMetadata {
+        source_type: event.source_type.clone().unwrap_or_default(),
+        provider_name: event.provider_name.clone(),
+        base_url_host: event.base_url_host.clone(),
+    };
+    upsert_account_usage_stats(
+        &mut window.accounts,
+        Some(event.account_id.as_str()),
+        Some(event.email.as_str()),
+        Some(&source_metadata),
+        event.success,
+        event.latency_ms,
+        Some(&usage),
+        event.timestamp,
+    );
+    upsert_api_key_usage_stats(
+        &mut window.api_keys,
+        Some(event.api_key_id.as_str()),
+        Some(event.api_key_name.as_str()),
+        event.success,
+        event.latency_ms,
+        Some(&usage),
+        event.timestamp,
+        Some(event.model_id.as_str()),
     );
     window.updated_at = window.updated_at.max(event.timestamp);
 }
@@ -2706,9 +3011,9 @@ fn recompute_time_windows(stats: &mut CodexLocalAccessStats, now: i64) {
         }
     }
 
-    sort_usage_accounts(&mut daily.accounts);
-    sort_usage_accounts(&mut weekly.accounts);
-    sort_usage_accounts(&mut monthly.accounts);
+    sort_window_usage_breakdowns(&mut daily);
+    sort_window_usage_breakdowns(&mut weekly);
+    sort_window_usage_breakdowns(&mut monthly);
 
     stats.daily = daily;
     stats.weekly = weekly;
@@ -2746,6 +3051,221 @@ fn generate_local_api_key() -> String {
     format!("agt_codex_{}", suffix)
 }
 
+fn generate_local_api_key_id() -> String {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect();
+    format!("key_{}", suffix)
+}
+
+fn generate_local_access_service_id() -> String {
+    let suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect();
+    format!("svc_{}", suffix)
+}
+
+fn normalize_local_access_service_name(name: &str) -> String {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        "API 服务".to_string()
+    } else {
+        normalized.chars().take(80).collect()
+    }
+}
+
+fn normalize_local_api_key_name(name: &str) -> String {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        "API Key".to_string()
+    } else {
+        normalized.chars().take(80).collect()
+    }
+}
+
+fn normalize_monthly_token_limit(limit: Option<u64>) -> Option<u64> {
+    limit.filter(|value| *value > 0)
+}
+
+fn normalize_account_ids_for_collection(
+    account_ids: Vec<String>,
+    collection_account_ids: &[String],
+) -> Vec<String> {
+    let requested: HashSet<String> = account_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    collection_account_ids
+        .iter()
+        .filter(|account_id| requested.contains(account_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn resolve_local_api_key_allowed_account_ids(
+    upstream_scope: Option<&str>,
+    allowed_account_ids: Option<Vec<String>>,
+    collection_account_ids: &[String],
+    current_allowed_account_ids: Option<Option<Vec<String>>>,
+) -> Result<Option<Vec<String>>, String> {
+    let normalized_scope = upstream_scope
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    match normalized_scope.as_deref() {
+        Some("all") => Ok(None),
+        Some("selected") => Ok(Some(normalize_account_ids_for_collection(
+            allowed_account_ids.unwrap_or_default(),
+            collection_account_ids,
+        ))),
+        Some(_) => Err("上游范围必须是 all 或 selected".to_string()),
+        None => Ok(current_allowed_account_ids.unwrap_or(None)),
+    }
+}
+
+fn effective_account_ids_for_api_key(
+    collection: &CodexLocalAccessCollection,
+    api_key: &CodexLocalAccessApiKey,
+) -> Vec<String> {
+    match api_key.allowed_account_ids.clone() {
+        Some(allowed_account_ids) => {
+            normalize_account_ids_for_collection(allowed_account_ids, &collection.account_ids)
+        }
+        None => collection.account_ids.clone(),
+    }
+}
+
+fn build_local_api_key(
+    name: &str,
+    key: Option<String>,
+    monthly_token_limit: Option<u64>,
+    allowed_account_ids: Option<Vec<String>>,
+) -> CodexLocalAccessApiKey {
+    let now = now_ms();
+    CodexLocalAccessApiKey {
+        id: generate_local_api_key_id(),
+        name: normalize_local_api_key_name(name),
+        key: key.unwrap_or_else(generate_local_api_key),
+        enabled: true,
+        monthly_token_limit: normalize_monthly_token_limit(monthly_token_limit),
+        allowed_account_ids,
+        created_at: now,
+        updated_at: now,
+        last_used_at: None,
+    }
+}
+
+fn new_default_collection() -> Result<CodexLocalAccessCollection, String> {
+    new_local_access_collection(
+        DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string(),
+        DEFAULT_LOCAL_ACCESS_SERVICE_NAME,
+    )
+}
+
+fn new_local_access_collection(
+    id: String,
+    name: &str,
+) -> Result<CodexLocalAccessCollection, String> {
+    let now = now_ms();
+    let default_api_key_id = generate_local_api_key_id();
+    Ok(CodexLocalAccessCollection {
+        id,
+        name: normalize_local_access_service_name(name),
+        enabled: false,
+        port: allocate_random_local_port()?,
+        api_keys: vec![CodexLocalAccessApiKey {
+            id: default_api_key_id.clone(),
+            name: "Default".to_string(),
+            key: generate_local_api_key(),
+            enabled: true,
+            monthly_token_limit: None,
+            allowed_account_ids: None,
+            created_at: now,
+            updated_at: now,
+            last_used_at: None,
+        }],
+        default_api_key_id: Some(default_api_key_id),
+        legacy_api_key: None,
+        routing_strategy: CodexLocalAccessRoutingStrategy::default(),
+        restrict_free_accounts: true,
+        account_ids: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn is_usable_local_access_api_key(api_key: &CodexLocalAccessApiKey) -> bool {
+    api_key.enabled && !api_key.key.trim().is_empty()
+}
+
+fn first_enabled_api_key(
+    collection: &CodexLocalAccessCollection,
+) -> Option<&CodexLocalAccessApiKey> {
+    collection
+        .api_keys
+        .iter()
+        .find(|api_key| is_usable_local_access_api_key(api_key))
+}
+
+fn resolve_default_api_key(
+    collection: &CodexLocalAccessCollection,
+) -> Option<&CodexLocalAccessApiKey> {
+    let default_api_key_id = collection
+        .default_api_key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(default_api_key_id) = default_api_key_id {
+        if let Some(api_key) = collection
+            .api_keys
+            .iter()
+            .find(|item| item.id == default_api_key_id && is_usable_local_access_api_key(item))
+        {
+            return Some(api_key);
+        }
+    }
+    first_enabled_api_key(collection)
+}
+
+fn find_enabled_api_key(
+    collection: &CodexLocalAccessCollection,
+    provided_key: &str,
+) -> Option<CodexLocalAccessApiKey> {
+    let provided_key = provided_key.trim();
+    if provided_key.is_empty() {
+        return None;
+    }
+    collection
+        .api_keys
+        .iter()
+        .find(|api_key| api_key.enabled && api_key.key.trim() == provided_key)
+        .cloned()
+}
+
+fn monthly_tokens_for_api_key(stats: &CodexLocalAccessStats, api_key_id: &str) -> u64 {
+    stats
+        .monthly
+        .api_keys
+        .iter()
+        .find(|item| item.api_key_id == api_key_id)
+        .map(|item| item.usage.total_tokens)
+        .unwrap_or(0)
+}
+
+fn is_api_key_over_monthly_limit(
+    stats: &CodexLocalAccessStats,
+    api_key: &CodexLocalAccessApiKey,
+) -> bool {
+    match api_key.monthly_token_limit {
+        Some(limit) if limit > 0 => monthly_tokens_for_api_key(stats, &api_key.id) >= limit,
+        _ => false,
+    }
+}
+
 fn allocate_random_local_port() -> Result<u16, String> {
     let listener = StdTcpListener::bind((CODEX_LOCAL_ACCESS_BIND_HOST, 0))
         .map_err(|e| format!("分配本地接入端口失败: {}", e))?;
@@ -2755,7 +3275,7 @@ fn allocate_random_local_port() -> Result<u16, String> {
         .map_err(|e| format!("读取本地接入端口失败: {}", e))
 }
 
-fn load_collection_from_disk() -> Result<Option<CodexLocalAccessCollection>, String> {
+fn load_config_from_disk() -> Result<Option<CodexLocalAccessConfig>, String> {
     let path = local_access_file_path()?;
     if !path.exists() {
         return Ok(None);
@@ -2763,14 +3283,30 @@ fn load_collection_from_disk() -> Result<Option<CodexLocalAccessCollection>, Str
 
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("读取本地接入配置失败: {}", e))?;
-    let parsed = serde_json::from_str::<CodexLocalAccessCollection>(&content)
+    let raw = serde_json::from_str::<Value>(&content)
         .map_err(|e| format!("解析本地接入配置失败: {}", e))?;
-    Ok(Some(parsed))
+    if raw.get("services").is_some() {
+        let parsed = serde_json::from_value::<CodexLocalAccessConfig>(raw)
+            .map_err(|e| format!("解析本地接入配置失败: {}", e))?;
+        return Ok(Some(parsed));
+    }
+    let mut collection = serde_json::from_value::<CodexLocalAccessCollection>(raw)
+        .map_err(|e| format!("解析本地接入配置失败: {}", e))?;
+    if collection.id.trim().is_empty() {
+        collection.id = DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string();
+    }
+    if collection.name.trim().is_empty() {
+        collection.name = DEFAULT_LOCAL_ACCESS_SERVICE_NAME.to_string();
+    }
+    Ok(Some(CodexLocalAccessConfig {
+        selected_service_id: Some(collection.id.clone()),
+        services: vec![collection],
+    }))
 }
 
-fn save_collection_to_disk(collection: &CodexLocalAccessCollection) -> Result<(), String> {
+fn save_config_to_disk(config: &CodexLocalAccessConfig) -> Result<(), String> {
     let path = local_access_file_path()?;
-    let content = serde_json::to_string_pretty(collection)
+    let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("序列化本地接入配置失败: {}", e))?;
     write_string_atomic(&path, &content)
 }
@@ -2784,34 +3320,65 @@ fn normalize_stats(stats: &mut CodexLocalAccessStats) {
         stats.updated_at = stats.since;
     }
     sort_usage_accounts(&mut stats.accounts);
+    sort_usage_api_keys(&mut stats.api_keys);
+    for api_key in &mut stats.api_keys {
+        sort_usage_models(&mut api_key.models);
+    }
+    trim_diagnostic_events(
+        &mut stats.diagnostic_events,
+        now.saturating_sub(MONTH_WINDOW_MS),
+    );
+    stats.upstream_health.sort_by(|left, right| {
+        left.account_id
+            .cmp(&right.account_id)
+            .then_with(|| right.last_failure_at.cmp(&left.last_failure_at))
+    });
     recompute_time_windows(stats, now);
 }
 
-fn load_stats_from_disk() -> Result<CodexLocalAccessStats, String> {
+fn normalize_stats_store(store: &mut CodexLocalAccessStatsStore) {
+    for stats in store.stats_by_service_id.values_mut() {
+        normalize_stats(stats);
+    }
+}
+
+fn load_stats_store_from_disk() -> Result<CodexLocalAccessStatsStore, String> {
     let path = local_access_stats_file_path()?;
     if !path.exists() {
-        return Ok(empty_stats_snapshot());
+        return Ok(CodexLocalAccessStatsStore::default());
     }
 
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("读取 API 服务统计失败: {}", e))?;
-    let mut parsed = serde_json::from_str::<CodexLocalAccessStats>(&content)
+    let raw = serde_json::from_str::<Value>(&content)
         .map_err(|e| format!("解析 API 服务统计失败: {}", e))?;
-    normalize_stats(&mut parsed);
-    Ok(parsed)
+    let mut store = if raw.get("statsByServiceId").is_some() {
+        serde_json::from_value::<CodexLocalAccessStatsStore>(raw)
+            .map_err(|e| format!("解析 API 服务统计失败: {}", e))?
+    } else {
+        let stats = serde_json::from_value::<CodexLocalAccessStats>(raw)
+            .map_err(|e| format!("解析 API 服务统计失败: {}", e))?;
+        let mut stats_by_service_id = HashMap::new();
+        stats_by_service_id.insert(DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string(), stats);
+        CodexLocalAccessStatsStore {
+            stats_by_service_id,
+        }
+    };
+    normalize_stats_store(&mut store);
+    Ok(store)
 }
 
-fn save_stats_to_disk(stats: &CodexLocalAccessStats) -> Result<(), String> {
+fn save_stats_store_to_disk(store: &CodexLocalAccessStatsStore) -> Result<(), String> {
     let path = local_access_stats_file_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 API 服务统计目录失败: {}", e))?;
     }
-    let content = serde_json::to_string_pretty(stats)
+    let content = serde_json::to_string_pretty(store)
         .map_err(|e| format!("序列化 API 服务统计失败: {}", e))?;
     write_string_atomic(&path, &content)
 }
 
-fn prune_runtime_routing_state(runtime: &mut GatewayRuntime, now: i64) {
+fn prune_runtime_routing_state(runtime: &mut GatewayServiceRuntime, now: i64) {
     runtime
         .response_affinity
         .retain(|_, binding| now.saturating_sub(binding.updated_at_ms) <= RESPONSE_AFFINITY_TTL_MS);
@@ -2839,17 +3406,18 @@ fn prune_runtime_routing_state(runtime: &mut GatewayRuntime, now: i64) {
     }
 }
 
-async fn resolve_affinity_account(previous_response_id: &str) -> Option<String> {
+async fn resolve_affinity_account(service_id: &str, previous_response_id: &str) -> Option<String> {
     let mut runtime = gateway_runtime().lock().await;
+    let service = runtime.services.get_mut(service_id)?;
     let now = now_ms();
-    prune_runtime_routing_state(&mut runtime, now);
-    runtime
+    prune_runtime_routing_state(service, now);
+    service
         .response_affinity
         .get(previous_response_id)
         .map(|binding| binding.account_id.clone())
 }
 
-async fn bind_response_affinity(response_id: &str, account_id: &str) {
+async fn bind_response_affinity(service_id: &str, response_id: &str, account_id: &str) {
     let response_id = response_id.trim();
     let account_id = account_id.trim();
     if response_id.is_empty() || account_id.is_empty() {
@@ -2857,30 +3425,41 @@ async fn bind_response_affinity(response_id: &str, account_id: &str) {
     }
 
     let mut runtime = gateway_runtime().lock().await;
+    let Some(service) = runtime.services.get_mut(service_id) else {
+        return;
+    };
     let now = now_ms();
-    prune_runtime_routing_state(&mut runtime, now);
-    runtime.response_affinity.insert(
+    prune_runtime_routing_state(service, now);
+    service.response_affinity.insert(
         response_id.to_string(),
         ResponseAffinityBinding {
             account_id: account_id.to_string(),
             updated_at_ms: now,
         },
     );
-    prune_runtime_routing_state(&mut runtime, now);
+    prune_runtime_routing_state(service, now);
 }
 
-async fn clear_model_cooldown(account_id: &str, model_key: &str) {
+async fn clear_model_cooldown(service_id: &str, account_id: &str, model_key: &str) {
     let Some(cooldown_key) = build_cooldown_key(account_id, model_key) else {
         return;
     };
 
     let mut runtime = gateway_runtime().lock().await;
+    let Some(service) = runtime.services.get_mut(service_id) else {
+        return;
+    };
     let now = now_ms();
-    prune_runtime_routing_state(&mut runtime, now);
-    runtime.model_cooldowns.remove(&cooldown_key);
+    prune_runtime_routing_state(service, now);
+    service.model_cooldowns.remove(&cooldown_key);
 }
 
-async fn set_model_cooldown(account_id: &str, model_key: &str, retry_after: Duration) {
+async fn set_model_cooldown(
+    service_id: &str,
+    account_id: &str,
+    model_key: &str,
+    retry_after: Duration,
+) {
     let Some(cooldown_key) = build_cooldown_key(account_id, model_key) else {
         return;
     };
@@ -2889,20 +3468,28 @@ async fn set_model_cooldown(account_id: &str, model_key: &str, retry_after: Dura
     }
 
     let mut runtime = gateway_runtime().lock().await;
+    let Some(service) = runtime.services.get_mut(service_id) else {
+        return;
+    };
     let now = now_ms();
     let next_retry_at_ms = now.saturating_add(retry_after.as_millis() as i64);
-    prune_runtime_routing_state(&mut runtime, now);
-    runtime
+    prune_runtime_routing_state(service, now);
+    service
         .model_cooldowns
         .insert(cooldown_key, AccountModelCooldown { next_retry_at_ms });
 }
 
-async fn get_model_cooldown_wait(account_id: &str, model_key: &str) -> Option<Duration> {
+async fn get_model_cooldown_wait(
+    service_id: &str,
+    account_id: &str,
+    model_key: &str,
+) -> Option<Duration> {
     let cooldown_key = build_cooldown_key(account_id, model_key)?;
     let mut runtime = gateway_runtime().lock().await;
+    let service = runtime.services.get_mut(service_id)?;
     let now = now_ms();
-    prune_runtime_routing_state(&mut runtime, now);
-    let cooldown = runtime.model_cooldowns.get(&cooldown_key)?;
+    prune_runtime_routing_state(service, now);
+    let cooldown = service.model_cooldowns.get(&cooldown_key)?;
     let wait_ms = cooldown.next_retry_at_ms.saturating_sub(now);
     if wait_ms <= 0 {
         return None;
@@ -2941,9 +3528,88 @@ fn is_free_plan_type(plan_type: Option<&str>) -> bool {
     !normalized.is_empty() && normalized.contains("free")
 }
 
+fn normalize_optional_trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_api_base_url_for_gateway(raw: Option<&str>) -> String {
+    normalize_optional_trimmed(raw)
+        .unwrap_or_else(|| DEFAULT_OPENAI_API_BASE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn extract_url_host(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    parsed
+        .host_str()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+}
+
+fn api_key_account_has_gateway_credentials(account: &CodexAccount) -> bool {
+    account.is_api_key_auth()
+        && account
+            .openai_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+}
+
+fn account_source_type(account: &CodexAccount) -> &'static str {
+    if account.is_api_key_auth() {
+        "openai_compatible"
+    } else {
+        "codex_oauth"
+    }
+}
+
+fn build_source_metadata(account: &CodexAccount) -> LocalAccessSourceMetadata {
+    if account.is_api_key_auth() {
+        let base_url = normalize_api_base_url_for_gateway(account.api_base_url.as_deref());
+        let base_url_host = extract_url_host(&base_url);
+        let provider_name = normalize_optional_trimmed(account.api_provider_name.as_deref())
+            .or_else(|| base_url_host.clone())
+            .or_else(|| Some("OpenAI API".to_string()));
+        return LocalAccessSourceMetadata {
+            source_type: account_source_type(account).to_string(),
+            provider_name,
+            base_url_host,
+        };
+    }
+
+    LocalAccessSourceMetadata {
+        source_type: account_source_type(account).to_string(),
+        provider_name: Some("Codex".to_string()),
+        base_url_host: Some("chatgpt.com".to_string()),
+    }
+}
+
+fn build_disabled_reason_for_local_access_account(
+    account: &CodexAccount,
+    restrict_free_accounts: bool,
+) -> Option<String> {
+    if account.is_api_key_auth() {
+        if api_key_account_has_gateway_credentials(account) {
+            None
+        } else {
+            Some("API Key 账号缺少可用密钥".to_string())
+        }
+    } else if restrict_free_accounts && is_free_plan_type(account.plan_type.as_deref()) {
+        Some("Free 账号被当前设置限制".to_string())
+    } else {
+        None
+    }
+}
+
 fn is_local_access_eligible_account(account: &CodexAccount, restrict_free_accounts: bool) -> bool {
     if account.is_api_key_auth() {
-        return false;
+        return api_key_account_has_gateway_credentials(account);
     }
     if restrict_free_accounts && is_free_plan_type(account.plan_type.as_deref()) {
         return false;
@@ -2951,19 +3617,165 @@ fn is_local_access_eligible_account(account: &CodexAccount, restrict_free_accoun
     true
 }
 
+fn build_local_access_upstream_sources(
+    collection: Option<&CodexLocalAccessCollection>,
+) -> Vec<CodexLocalAccessUpstreamSource> {
+    let selected_ids: HashSet<String> = collection
+        .map(|item| item.account_ids.iter().cloned().collect())
+        .unwrap_or_default();
+    let restrict_free_accounts = collection
+        .map(|item| item.restrict_free_accounts)
+        .unwrap_or(true);
+
+    let mut sources: Vec<CodexLocalAccessUpstreamSource> = codex_account::list_accounts_checked()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|account| {
+            let metadata = build_source_metadata(&account);
+            let disabled_reason =
+                build_disabled_reason_for_local_access_account(&account, restrict_free_accounts);
+            CodexLocalAccessUpstreamSource {
+                account_id: account.id.clone(),
+                email: account.email.clone(),
+                source_type: metadata.source_type,
+                provider_name: metadata.provider_name,
+                base_url_host: metadata.base_url_host,
+                selected: selected_ids.contains(&account.id),
+                eligible: disabled_reason.is_none(),
+                disabled_reason,
+            }
+        })
+        .collect();
+
+    sources.sort_by(|left, right| {
+        left.source_type
+            .cmp(&right.source_type)
+            .then_with(|| left.email.cmp(&right.email))
+            .then_with(|| left.account_id.cmp(&right.account_id))
+    });
+    sources
+}
+
+fn sanitize_collection_api_keys(collection: &mut CodexLocalAccessCollection) -> bool {
+    let mut changed = false;
+    if collection.api_keys.is_empty() {
+        let migrated_key = collection
+            .legacy_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(generate_local_api_key);
+        let now = now_ms();
+        let default_api_key_id = generate_local_api_key_id();
+        collection.api_keys.push(CodexLocalAccessApiKey {
+            id: default_api_key_id.clone(),
+            name: "Default".to_string(),
+            key: migrated_key,
+            enabled: true,
+            monthly_token_limit: None,
+            allowed_account_ids: None,
+            created_at: now,
+            updated_at: now,
+            last_used_at: None,
+        });
+        collection.default_api_key_id = Some(default_api_key_id);
+        changed = true;
+    }
+    if collection.legacy_api_key.is_some() {
+        collection.legacy_api_key = None;
+        changed = true;
+    }
+    let mut seen_ids = HashSet::new();
+    let mut seen_keys = HashSet::new();
+    for (index, api_key) in collection.api_keys.iter_mut().enumerate() {
+        let normalized_id = api_key.id.trim().to_string();
+        if normalized_id != api_key.id {
+            api_key.id = normalized_id;
+            changed = true;
+        }
+        if api_key.id.is_empty() || !seen_ids.insert(api_key.id.clone()) {
+            api_key.id = generate_local_api_key_id();
+            seen_ids.insert(api_key.id.clone());
+            changed = true;
+        }
+        let normalized_name = normalize_local_api_key_name(&api_key.name);
+        if normalized_name != api_key.name {
+            api_key.name = if normalized_name == "API Key" && index == 0 {
+                "Default".to_string()
+            } else {
+                normalized_name
+            };
+            changed = true;
+        }
+        let normalized_key = api_key.key.trim().to_string();
+        if normalized_key != api_key.key {
+            api_key.key = normalized_key;
+            changed = true;
+        }
+        if api_key.key.is_empty() || !seen_keys.insert(api_key.key.clone()) {
+            api_key.key = generate_local_api_key();
+            seen_keys.insert(api_key.key.clone());
+            changed = true;
+        }
+        let normalized_limit = normalize_monthly_token_limit(api_key.monthly_token_limit);
+        if normalized_limit != api_key.monthly_token_limit {
+            api_key.monthly_token_limit = normalized_limit;
+            changed = true;
+        }
+        if api_key.created_at <= 0 {
+            api_key.created_at = now_ms();
+            changed = true;
+        }
+        if api_key.updated_at <= 0 {
+            api_key.updated_at = api_key.created_at;
+            changed = true;
+        }
+    }
+    let normalized_default_api_key_id = collection
+        .default_api_key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if collection.default_api_key_id.as_ref() != normalized_default_api_key_id.as_ref() {
+        collection.default_api_key_id = normalized_default_api_key_id;
+        changed = true;
+    }
+    let next_default_api_key_id =
+        resolve_default_api_key(collection).map(|api_key| api_key.id.clone());
+    if collection.default_api_key_id.as_ref() != next_default_api_key_id.as_ref() {
+        collection.default_api_key_id = next_default_api_key_id;
+        changed = true;
+    }
+    changed
+}
+
 fn sanitize_collection(
     collection: &mut CodexLocalAccessCollection,
 ) -> Result<(bool, HashSet<String>), String> {
     let mut changed = false;
 
+    let normalized_id = collection.id.trim().to_string();
+    if normalized_id != collection.id {
+        collection.id = normalized_id;
+        changed = true;
+    }
+    if collection.id.is_empty() {
+        collection.id = generate_local_access_service_id();
+        changed = true;
+    }
+    let normalized_name = normalize_local_access_service_name(&collection.name);
+    if normalized_name != collection.name {
+        collection.name = normalized_name;
+        changed = true;
+    }
+
     if collection.port == 0 {
         collection.port = allocate_random_local_port()?;
         changed = true;
     }
-    if collection.api_key.trim().is_empty() {
-        collection.api_key = generate_local_api_key();
-        changed = true;
-    }
+    changed = sanitize_collection_api_keys(collection) || changed;
     if collection.created_at <= 0 {
         collection.created_at = now_ms();
         changed = true;
@@ -2999,7 +3811,153 @@ fn sanitize_collection(
         changed = true;
     }
 
+    for api_key in &mut collection.api_keys {
+        let Some(allowed_account_ids) = api_key.allowed_account_ids.clone() else {
+            continue;
+        };
+        let normalized_allowed_account_ids =
+            normalize_account_ids_for_collection(allowed_account_ids, &collection.account_ids);
+        if api_key.allowed_account_ids.as_ref() != Some(&normalized_allowed_account_ids) {
+            api_key.allowed_account_ids = Some(normalized_allowed_account_ids);
+            changed = true;
+        }
+    }
+
     Ok((changed, valid_account_ids))
+}
+
+fn sanitize_config(config: &mut CodexLocalAccessConfig) -> Result<bool, String> {
+    let mut changed = false;
+    if config.services.is_empty() {
+        config.services.push(new_default_collection()?);
+        config.selected_service_id = Some(DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string());
+        changed = true;
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut seen_ports = HashSet::new();
+    for (index, collection) in config.services.iter_mut().enumerate() {
+        if collection.id.trim().is_empty() {
+            collection.id = if index == 0 {
+                DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string()
+            } else {
+                generate_local_access_service_id()
+            };
+            changed = true;
+        }
+        if collection.name.trim().is_empty() {
+            collection.name = if index == 0 {
+                DEFAULT_LOCAL_ACCESS_SERVICE_NAME.to_string()
+            } else {
+                format!("API 服务 {}", index.saturating_add(1))
+            };
+            changed = true;
+        }
+        let (collection_changed, _) = sanitize_collection(collection)?;
+        changed = changed || collection_changed;
+        if !seen_ids.insert(collection.id.clone()) {
+            collection.id = generate_local_access_service_id();
+            seen_ids.insert(collection.id.clone());
+            changed = true;
+        }
+        if !seen_ports.insert(collection.port) {
+            collection.port = allocate_random_local_port()?;
+            seen_ports.insert(collection.port);
+            changed = true;
+        }
+    }
+
+    let normalized_selected = config
+        .selected_service_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if config.selected_service_id.as_ref() != normalized_selected.as_ref() {
+        config.selected_service_id = normalized_selected;
+        changed = true;
+    }
+    let selected_exists = config
+        .selected_service_id
+        .as_deref()
+        .map(|selected| config.services.iter().any(|service| service.id == selected))
+        .unwrap_or(false);
+    if !selected_exists {
+        config.selected_service_id = config.services.first().map(|service| service.id.clone());
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+fn build_config_from_runtime(runtime: &GatewayRuntime) -> CodexLocalAccessConfig {
+    let mut services: Vec<CodexLocalAccessCollection> = runtime
+        .services
+        .values()
+        .filter_map(|service| service.collection.clone())
+        .collect();
+    services.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    CodexLocalAccessConfig {
+        services,
+        selected_service_id: runtime.selected_service_id.clone(),
+    }
+}
+
+fn service_runtime_from_collection(
+    collection: CodexLocalAccessCollection,
+    stats: CodexLocalAccessStats,
+) -> GatewayServiceRuntime {
+    let mut service = GatewayServiceRuntime {
+        collection: Some(collection),
+        stats,
+        ..GatewayServiceRuntime::default()
+    };
+    normalize_stats(&mut service.stats);
+    service
+}
+
+fn selected_service_id(runtime: &GatewayRuntime) -> Option<String> {
+    runtime
+        .selected_service_id
+        .as_deref()
+        .filter(|id| runtime.services.contains_key(*id))
+        .map(str::to_string)
+        .or_else(|| {
+            runtime
+                .services
+                .keys()
+                .min()
+                .map(|service_id| service_id.to_string())
+        })
+}
+
+fn resolve_service_id(
+    runtime: &GatewayRuntime,
+    service_id: Option<&str>,
+) -> Result<String, String> {
+    let normalized = service_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| selected_service_id(runtime));
+    let Some(service_id) = normalized else {
+        return Err("API 服务不存在".to_string());
+    };
+    if runtime.services.contains_key(&service_id) {
+        Ok(service_id)
+    } else {
+        Err("API 服务不存在".to_string())
+    }
+}
+
+fn persist_runtime_config(runtime: &GatewayRuntime) -> Result<(), String> {
+    let config = build_config_from_runtime(runtime);
+    save_config_to_disk(&config)
 }
 
 async fn ensure_runtime_loaded_without_start() -> Result<(), String> {
@@ -3010,50 +3968,38 @@ async fn ensure_runtime_loaded_without_start() -> Result<(), String> {
         }
     }
 
-    let loaded_collection = load_collection_from_disk()?;
-    let mut loaded_stats = load_stats_from_disk()?;
-    let mut next_collection = loaded_collection;
+    let mut config = load_config_from_disk()?.unwrap_or_default();
+    let mut stats_store = load_stats_store_from_disk()?;
     let mut persist_after_load = false;
 
-    if next_collection.is_none() {
-        next_collection = Some(CodexLocalAccessCollection {
-            enabled: false,
-            port: allocate_random_local_port()?,
-            api_key: generate_local_api_key(),
-            routing_strategy: CodexLocalAccessRoutingStrategy::default(),
-            restrict_free_accounts: true,
-            account_ids: Vec::new(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-        });
+    if config.services.is_empty() {
+        config.services.push(new_default_collection()?);
+        config.selected_service_id = Some(DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string());
         persist_after_load = true;
     }
-
-    if let Some(collection) = next_collection.as_mut() {
-        let (changed, _) = sanitize_collection(collection)?;
-        persist_after_load = persist_after_load || changed;
-    }
+    persist_after_load = sanitize_config(&mut config)? || persist_after_load;
 
     if persist_after_load {
-        if let Some(collection) = next_collection.as_ref() {
-            save_collection_to_disk(collection)?;
-        }
+        save_config_to_disk(&config)?;
     }
 
     {
         let mut runtime = gateway_runtime().lock().await;
-        normalize_stats(&mut loaded_stats);
-        runtime.stats_dirty = false;
         runtime.stats_flush_inflight = false;
-        runtime.stats = loaded_stats;
-        if let Some(collection) = next_collection.clone() {
-            sync_runtime_collection(&mut runtime, collection);
-        } else {
-            runtime.loaded = true;
-            runtime.collection = None;
-            runtime.last_error = None;
-            prune_prepared_account_cache(&mut runtime, now_ms());
+        runtime.selected_service_id = config.selected_service_id.clone();
+        runtime.services.clear();
+        for collection in config.services {
+            let service_id = collection.id.clone();
+            let stats = stats_store
+                .stats_by_service_id
+                .remove(&service_id)
+                .unwrap_or_else(empty_stats_snapshot);
+            runtime.services.insert(
+                service_id,
+                service_runtime_from_collection(collection, stats),
+            );
         }
+        runtime.loaded = true;
     }
 
     Ok(())
@@ -3062,34 +4008,48 @@ async fn ensure_runtime_loaded_without_start() -> Result<(), String> {
 async fn ensure_runtime_loaded() -> Result<(), String> {
     ensure_runtime_loaded_without_start().await?;
 
-    let should_start = {
+    let enabled_service_ids = {
         let runtime = gateway_runtime().lock().await;
         runtime
-            .collection
-            .as_ref()
-            .map(|collection| collection.enabled)
-            .unwrap_or(false)
+            .services
+            .iter()
+            .filter_map(|(service_id, service)| {
+                service
+                    .collection
+                    .as_ref()
+                    .filter(|collection| collection.enabled)
+                    .map(|_| service_id.clone())
+            })
+            .collect::<Vec<_>>()
     };
 
-    if should_start {
-        ensure_gateway_matches_runtime().await?;
+    for service_id in enabled_service_ids {
+        ensure_gateway_matches_runtime(Some(service_id.as_str())).await?;
     }
 
     Ok(())
 }
 
-async fn ensure_gateway_matches_runtime() -> Result<(), String> {
+async fn ensure_gateway_matches_runtime(service_id: Option<&str>) -> Result<(), String> {
+    let resolved_service_id = {
+        let runtime = gateway_runtime().lock().await;
+        resolve_service_id(&runtime, service_id)?
+    };
     let (collection, running, actual_port, stale_task) = {
         let mut runtime = gateway_runtime().lock().await;
-        let stale_task = if !runtime.running {
-            runtime.task.take()
+        let service = runtime
+            .services
+            .get_mut(&resolved_service_id)
+            .ok_or_else(|| "API 服务不存在".to_string())?;
+        let stale_task = if !service.running {
+            service.task.take()
         } else {
             None
         };
         (
-            runtime.collection.clone(),
-            runtime.running,
-            runtime.actual_port,
+            service.collection.clone(),
+            service.running,
+            service.actual_port,
             stale_task,
         )
     };
@@ -3099,12 +4059,12 @@ async fn ensure_gateway_matches_runtime() -> Result<(), String> {
     }
 
     let Some(collection) = collection else {
-        stop_gateway().await;
+        stop_gateway(Some(resolved_service_id.as_str())).await;
         return Ok(());
     };
 
     if !collection.enabled {
-        stop_gateway().await;
+        stop_gateway(Some(resolved_service_id.as_str())).await;
         return Ok(());
     }
 
@@ -3112,26 +4072,30 @@ async fn ensure_gateway_matches_runtime() -> Result<(), String> {
         return Ok(());
     }
 
-    stop_gateway().await;
+    stop_gateway(Some(resolved_service_id.as_str())).await;
 
     let listener = match TcpListener::bind((CODEX_LOCAL_ACCESS_BIND_HOST, collection.port)).await {
         Ok(listener) => listener,
         Err(error) => {
             let message = format_gateway_bind_error(collection.port, &error);
             let mut runtime = gateway_runtime().lock().await;
-            runtime.running = false;
-            runtime.actual_port = None;
-            runtime.last_error = Some(message.clone());
+            if let Some(service) = runtime.services.get_mut(&resolved_service_id) {
+                service.running = false;
+                service.actual_port = None;
+                service.last_error = Some(message.clone());
+            }
             return Err(message);
         }
     };
     let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
     let port = collection.port;
+    let task_service_id = resolved_service_id.clone();
 
     let task = tokio::spawn(async move {
         logger::log_codex_api_info(&format!(
-            "[CodexLocalAccess] 本地接入服务已启动: {}",
-            build_base_url(port)
+            "[CodexLocalAccess] 本地接入服务已启动: {} ({})",
+            build_base_url(port),
+            task_service_id
         ));
 
         loop {
@@ -3144,8 +4108,9 @@ async fn ensure_gateway_matches_runtime() -> Result<(), String> {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, addr)) => {
+                            let connection_service_id = task_service_id.clone();
                             tokio::spawn(async move {
-                                if let Err(err) = handle_connection(stream, addr).await {
+                                if let Err(err) = handle_connection(connection_service_id, stream, addr).await {
                                     logger::log_codex_api_warn(&format!(
                                         "[CodexLocalAccess] 请求处理失败 {}: {}",
                                         addr, err
@@ -3166,28 +4131,43 @@ async fn ensure_gateway_matches_runtime() -> Result<(), String> {
         }
 
         let mut runtime = gateway_runtime().lock().await;
-        if runtime.actual_port == Some(port) {
-            runtime.running = false;
-            runtime.actual_port = None;
-            runtime.shutdown_sender = None;
+        if let Some(service) = runtime.services.get_mut(&task_service_id) {
+            if service.actual_port == Some(port) {
+                service.running = false;
+                service.actual_port = None;
+                service.shutdown_sender = None;
+            }
         }
     });
 
     let mut runtime = gateway_runtime().lock().await;
-    runtime.running = true;
-    runtime.actual_port = Some(collection.port);
-    runtime.last_error = None;
-    runtime.shutdown_sender = Some(shutdown_sender);
-    runtime.task = Some(task);
+    let service = runtime
+        .services
+        .get_mut(&resolved_service_id)
+        .ok_or_else(|| "API 服务不存在".to_string())?;
+    service.running = true;
+    service.actual_port = Some(collection.port);
+    service.last_error = None;
+    service.shutdown_sender = Some(shutdown_sender);
+    service.task = Some(task);
     Ok(())
 }
 
-async fn stop_gateway() {
+async fn stop_gateway(service_id: Option<&str>) {
     let (shutdown_sender, task) = {
         let mut runtime = gateway_runtime().lock().await;
-        runtime.running = false;
-        runtime.actual_port = None;
-        (runtime.shutdown_sender.take(), runtime.task.take())
+        let resolved = service_id
+            .and_then(|value| resolve_service_id(&runtime, Some(value)).ok())
+            .or_else(|| selected_service_id(&runtime));
+        let Some(resolved) = resolved else {
+            return;
+        };
+        let Some(service) = runtime.services.get_mut(&resolved) else {
+            return;
+        };
+        service.running = false;
+        service.actual_port = None;
+        (service.shutdown_sender.take(), service.task.take())
     };
 
     if let Some(sender) = shutdown_sender {
@@ -3232,10 +4212,36 @@ fn apply_usage_stats(
     }
 }
 
+fn upsert_model_usage_stats(
+    models: &mut Vec<CodexLocalAccessModelStats>,
+    model_id: Option<&str>,
+    success: bool,
+    latency_ms: u64,
+    usage: Option<&UsageCapture>,
+    updated_at: i64,
+) {
+    let model_id = normalize_usage_model_id(model_id);
+
+    if let Some(model_stats) = models.iter_mut().find(|item| item.model_id == model_id) {
+        model_stats.updated_at = updated_at;
+        apply_usage_stats(&mut model_stats.usage, success, latency_ms, usage);
+        return;
+    }
+
+    let mut model_stats = CodexLocalAccessModelStats {
+        model_id,
+        usage: CodexLocalAccessUsageStats::default(),
+        updated_at,
+    };
+    apply_usage_stats(&mut model_stats.usage, success, latency_ms, usage);
+    models.push(model_stats);
+}
+
 fn upsert_account_usage_stats(
     accounts: &mut Vec<CodexLocalAccessAccountStats>,
     account_id: Option<&str>,
     account_email: Option<&str>,
+    source_metadata: Option<&LocalAccessSourceMetadata>,
     success: bool,
     latency_ms: u64,
     usage: Option<&UsageCapture>,
@@ -3257,6 +4263,17 @@ fn upsert_account_usage_stats(
         if !normalized_email.is_empty() {
             account_stats.email = normalized_email;
         }
+        if let Some(metadata) = source_metadata {
+            if !metadata.source_type.trim().is_empty() {
+                account_stats.source_type = Some(metadata.source_type.clone());
+            }
+            if metadata.provider_name.is_some() {
+                account_stats.provider_name = metadata.provider_name.clone();
+            }
+            if metadata.base_url_host.is_some() {
+                account_stats.base_url_host = metadata.base_url_host.clone();
+            }
+        }
         account_stats.updated_at = updated_at;
         apply_usage_stats(&mut account_stats.usage, success, latency_ms, usage);
         return;
@@ -3265,6 +4282,11 @@ fn upsert_account_usage_stats(
     let mut account_stats = CodexLocalAccessAccountStats {
         account_id: account_id.to_string(),
         email: normalized_email,
+        source_type: source_metadata
+            .map(|metadata| metadata.source_type.clone())
+            .filter(|value| !value.trim().is_empty()),
+        provider_name: source_metadata.and_then(|metadata| metadata.provider_name.clone()),
+        base_url_host: source_metadata.and_then(|metadata| metadata.base_url_host.clone()),
         usage: CodexLocalAccessUsageStats::default(),
         updated_at,
     };
@@ -3272,51 +4294,688 @@ fn upsert_account_usage_stats(
     accounts.push(account_stats);
 }
 
+fn upsert_api_key_usage_stats(
+    api_keys: &mut Vec<CodexLocalAccessApiKeyStats>,
+    api_key_id: Option<&str>,
+    api_key_name: Option<&str>,
+    success: bool,
+    latency_ms: u64,
+    usage: Option<&UsageCapture>,
+    updated_at: i64,
+    model_id: Option<&str>,
+) {
+    let Some(api_key_id) = api_key_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let normalized_name = api_key_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("API Key")
+        .to_string();
+
+    if let Some(api_key_stats) = api_keys
+        .iter_mut()
+        .find(|item| item.api_key_id == api_key_id)
+    {
+        api_key_stats.api_key_name = normalized_name;
+        api_key_stats.updated_at = updated_at;
+        apply_usage_stats(&mut api_key_stats.usage, success, latency_ms, usage);
+        upsert_model_usage_stats(
+            &mut api_key_stats.models,
+            model_id,
+            success,
+            latency_ms,
+            usage,
+            updated_at,
+        );
+        return;
+    }
+
+    let mut api_key_stats = CodexLocalAccessApiKeyStats {
+        api_key_id: api_key_id.to_string(),
+        api_key_name: normalized_name,
+        usage: CodexLocalAccessUsageStats::default(),
+        models: Vec::new(),
+        updated_at,
+    };
+    apply_usage_stats(&mut api_key_stats.usage, success, latency_ms, usage);
+    upsert_model_usage_stats(
+        &mut api_key_stats.models,
+        model_id,
+        success,
+        latency_ms,
+        usage,
+        updated_at,
+    );
+    api_keys.push(api_key_stats);
+}
+
 async fn record_request_stats(
+    service_id: &str,
+    model_id: Option<&str>,
     account_id: Option<&str>,
     account_email: Option<&str>,
+    source_metadata: Option<&LocalAccessSourceMetadata>,
+    api_key_id: Option<&str>,
+    api_key_name: Option<&str>,
     success: bool,
     latency_ms: u64,
     usage: Option<UsageCapture>,
+    failure_status: Option<u16>,
+    failure_message: Option<&str>,
+    failure_category: Option<&str>,
+    retryable: bool,
 ) -> Result<(), String> {
     {
         let mut runtime = gateway_runtime().lock().await;
+        let service = runtime
+            .services
+            .get_mut(service_id)
+            .ok_or_else(|| "API 服务不存在".to_string())?;
         let now = now_ms();
         let usage_ref = usage.as_ref();
-        if runtime.stats.since <= 0 {
-            runtime.stats.since = now;
+        if service.stats.since <= 0 {
+            service.stats.since = now;
         }
-        runtime.stats.updated_at = now;
-        apply_usage_stats(&mut runtime.stats.totals, success, latency_ms, usage_ref);
+        service.stats.updated_at = now;
+        apply_usage_stats(&mut service.stats.totals, success, latency_ms, usage_ref);
         upsert_account_usage_stats(
-            &mut runtime.stats.accounts,
+            &mut service.stats.accounts,
             account_id,
             account_email,
+            source_metadata,
             success,
             latency_ms,
             usage_ref,
             now,
+        );
+        upsert_api_key_usage_stats(
+            &mut service.stats.api_keys,
+            api_key_id,
+            api_key_name,
+            success,
+            latency_ms,
+            usage_ref,
+            now,
+            model_id,
         );
         append_usage_event(
-            &mut runtime.stats.events,
+            &mut service.stats.events,
             now,
+            model_id,
             account_id,
             account_email,
+            source_metadata,
+            api_key_id,
+            api_key_name,
             success,
             latency_ms,
             usage_ref,
         );
+        upsert_upstream_health_sample(
+            &mut service.stats.upstream_health,
+            account_id,
+            account_email,
+            source_metadata,
+            success,
+            latency_ms,
+            failure_message,
+            now,
+        );
+        if !success {
+            append_diagnostic_event(
+                &mut service.stats,
+                now,
+                if failure_status.map(|status| status >= 500).unwrap_or(false) {
+                    "error"
+                } else {
+                    "warning"
+                },
+                failure_category.unwrap_or("gateway_request"),
+                api_key_id,
+                account_id,
+                model_id,
+                failure_status,
+                source_metadata.and_then(|metadata| metadata.base_url_host.as_deref()),
+                failure_message.unwrap_or("请求失败"),
+                retryable,
+            );
+        }
 
-        normalize_stats(&mut runtime.stats);
-        runtime.stats_dirty = true;
+        normalize_stats(&mut service.stats);
+        service.stats_dirty = true;
     }
 
     schedule_stats_flush_if_needed().await;
     Ok(())
 }
 
-fn build_state_snapshot(runtime: &GatewayRuntime) -> CodexLocalAccessState {
-    let collection = runtime.collection.clone();
+async fn record_upstream_health_check_result(
+    service_id: &str,
+    account: &CodexAccount,
+    success: bool,
+    latency_ms: u64,
+    status_code: Option<u16>,
+    message: Option<&str>,
+    retryable: bool,
+) -> Result<(), String> {
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        let service = runtime
+            .services
+            .get_mut(service_id)
+            .ok_or_else(|| "API 服务不存在".to_string())?;
+        let now = now_ms();
+        let metadata = build_source_metadata(account);
+        if service.stats.since <= 0 {
+            service.stats.since = now;
+        }
+        service.stats.updated_at = now;
+        upsert_upstream_health_sample(
+            &mut service.stats.upstream_health,
+            Some(account.id.as_str()),
+            Some(account.email.as_str()),
+            Some(&metadata),
+            success,
+            latency_ms,
+            message,
+            now,
+        );
+        if !success {
+            append_diagnostic_event(
+                &mut service.stats,
+                now,
+                if status_code.map(|status| status >= 500).unwrap_or(false) {
+                    "error"
+                } else {
+                    "warning"
+                },
+                "upstream_health_check",
+                None,
+                Some(account.id.as_str()),
+                None,
+                status_code,
+                metadata.base_url_host.as_deref(),
+                message.unwrap_or("上游健康检查失败"),
+                retryable,
+            );
+        }
+        normalize_stats(&mut service.stats);
+        service.stats_dirty = true;
+    }
+
+    schedule_stats_flush_if_needed().await;
+    Ok(())
+}
+
+async fn touch_local_access_api_key(service_id: &str, api_key_id: &str) {
+    let normalized_id = api_key_id.trim();
+    if normalized_id.is_empty() {
+        return;
+    }
+
+    let maybe_collection = {
+        let runtime = gateway_runtime().lock().await;
+        runtime
+            .services
+            .get(service_id)
+            .and_then(|service| service.collection.clone())
+    };
+    let Some(mut collection) = maybe_collection else {
+        return;
+    };
+    let now = now_ms();
+    let Some(api_key) = collection
+        .api_keys
+        .iter_mut()
+        .find(|item| item.id == normalized_id)
+    else {
+        return;
+    };
+
+    if api_key
+        .last_used_at
+        .map(|last_used_at| now.saturating_sub(last_used_at) < 60_000)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    api_key.last_used_at = Some(now);
+    api_key.updated_at = now;
+    collection.updated_at = now;
+
+    let mut runtime = gateway_runtime().lock().await;
+    if let Some(service) = runtime.services.get_mut(service_id) {
+        sync_runtime_collection(service, collection);
+    }
+    if let Err(err) = persist_runtime_config(&runtime) {
+        logger::log_codex_api_warn(&format!(
+            "[CodexLocalAccess] 写入 API Key 最近使用时间失败: {}",
+            err
+        ));
+    }
+}
+
+fn cooldown_until_for_account(
+    cooldowns: &HashMap<String, AccountModelCooldown>,
+    account_id: &str,
+    now: i64,
+) -> Option<i64> {
+    let prefix = format!("{}\u{1f}", account_id.trim());
+    cooldowns
+        .iter()
+        .filter(|(key, cooldown)| key.starts_with(&prefix) && cooldown.next_retry_at_ms > now)
+        .map(|(_, cooldown)| cooldown.next_retry_at_ms)
+        .max()
+}
+
+fn push_diagnostic_alert(
+    alerts: &mut Vec<CodexLocalAccessAlert>,
+    severity: &str,
+    category: &str,
+    id_suffix: &str,
+    message: String,
+    account_id: Option<String>,
+    api_key_id: Option<String>,
+    now: i64,
+) {
+    alerts.push(CodexLocalAccessAlert {
+        id: format!("{}:{}", category, id_suffix),
+        severity: severity.to_string(),
+        category: category.to_string(),
+        message: sanitize_diagnostic_message(&message),
+        account_id,
+        api_key_id,
+        created_at: now,
+    });
+}
+
+fn build_local_access_diagnostics(
+    runtime: &GatewayServiceRuntime,
+    collection: Option<&CodexLocalAccessCollection>,
+    upstream_sources: &[CodexLocalAccessUpstreamSource],
+    stats: &CodexLocalAccessStats,
+) -> CodexLocalAccessDiagnostics {
+    let now = now_ms();
+    let persisted_health_by_id: HashMap<String, CodexLocalAccessUpstreamHealth> = stats
+        .upstream_health
+        .iter()
+        .map(|health| (health.account_id.clone(), health.clone()))
+        .collect();
+
+    let mut upstreams = Vec::new();
+    for source in upstream_sources {
+        let mut health = persisted_health_by_id
+            .get(&source.account_id)
+            .cloned()
+            .unwrap_or_else(|| CodexLocalAccessUpstreamHealth {
+                account_id: source.account_id.clone(),
+                healthy: source.eligible,
+                ..CodexLocalAccessUpstreamHealth::default()
+            });
+        health.account_id = source.account_id.clone();
+        health.email = source.email.clone();
+        health.source_type = source.source_type.clone();
+        health.provider_name = source.provider_name.clone();
+        health.base_url_host = source.base_url_host.clone();
+        health.selected = source.selected;
+        health.eligible = source.eligible;
+        health.authorized_api_key_count = collection
+            .map(|collection| {
+                collection
+                    .api_keys
+                    .iter()
+                    .filter(|api_key| is_usable_local_access_api_key(api_key))
+                    .filter(|api_key| {
+                        effective_account_ids_for_api_key(collection, api_key)
+                            .iter()
+                            .any(|account_id| account_id == &source.account_id)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        health.cooldown_until =
+            cooldown_until_for_account(&runtime.model_cooldowns, source.account_id.as_str(), now);
+        health.cooling_down = health.cooldown_until.is_some();
+        let last_failure = health.last_failure_at.unwrap_or(0);
+        let last_success = health.last_success_at.unwrap_or(0);
+        if last_success == 0 && last_failure == 0 {
+            health.healthy = source.eligible;
+        } else if last_success >= last_failure && health.consecutive_failures == 0 {
+            health.healthy = source.eligible;
+        } else {
+            health.healthy = false;
+        }
+        if health.cooling_down || !source.eligible {
+            health.healthy = false;
+        }
+        upstreams.push(health);
+    }
+
+    let upstream_health_by_id: HashMap<String, CodexLocalAccessUpstreamHealth> = upstreams
+        .iter()
+        .map(|health| (health.account_id.clone(), health.clone()))
+        .collect();
+    let mut api_keys = Vec::new();
+    if let Some(collection) = collection {
+        for api_key in &collection.api_keys {
+            let effective_ids = effective_account_ids_for_api_key(collection, api_key);
+            let available_account_count = effective_ids
+                .iter()
+                .filter(|account_id| {
+                    upstream_health_by_id
+                        .get(*account_id)
+                        .map(|health| {
+                            health.selected
+                                && health.eligible
+                                && health.healthy
+                                && !health.cooling_down
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+            let monthly_tokens_used = monthly_tokens_for_api_key(stats, api_key.id.as_str());
+            let monthly_usage_ratio = api_key
+                .monthly_token_limit
+                .filter(|limit| *limit > 0)
+                .map(|limit| monthly_tokens_used as f64 / limit as f64);
+            let latest_failure = stats
+                .diagnostic_events
+                .iter()
+                .rev()
+                .find(|event| event.api_key_id.as_deref() == Some(api_key.id.as_str()));
+            let mut warning_count = 0u32;
+            if api_key.enabled && effective_ids.is_empty() {
+                warning_count = warning_count.saturating_add(1);
+            }
+            if api_key.enabled && !effective_ids.is_empty() && available_account_count == 0 {
+                warning_count = warning_count.saturating_add(1);
+            }
+            if monthly_usage_ratio
+                .map(|ratio| ratio >= 0.9)
+                .unwrap_or(false)
+            {
+                warning_count = warning_count.saturating_add(1);
+            }
+            api_keys.push(CodexLocalAccessApiKeyHealth {
+                api_key_id: api_key.id.clone(),
+                api_key_name: api_key.name.clone(),
+                enabled: api_key.enabled,
+                is_default: collection.default_api_key_id.as_deref() == Some(api_key.id.as_str()),
+                authorized_account_count: effective_ids.len(),
+                available_account_count,
+                monthly_token_limit: api_key.monthly_token_limit,
+                monthly_tokens_used,
+                monthly_usage_ratio,
+                last_failure_at: latest_failure.map(|event| event.timestamp),
+                last_failure_reason: latest_failure.map(|event| event.message.clone()),
+                warning_count,
+            });
+        }
+    }
+
+    let mut alerts = Vec::new();
+    match collection {
+        Some(collection) => {
+            if !collection.enabled {
+                push_diagnostic_alert(
+                    &mut alerts,
+                    "warning",
+                    "service",
+                    "disabled",
+                    "API 服务当前未启用".to_string(),
+                    None,
+                    None,
+                    now,
+                );
+            }
+            if collection.enabled && !runtime.running {
+                push_diagnostic_alert(
+                    &mut alerts,
+                    "error",
+                    "service",
+                    "not_running",
+                    "API 服务已启用但当前未运行".to_string(),
+                    None,
+                    None,
+                    now,
+                );
+            }
+            if collection
+                .api_keys
+                .iter()
+                .all(|api_key| !is_usable_local_access_api_key(api_key))
+            {
+                push_diagnostic_alert(
+                    &mut alerts,
+                    "error",
+                    "api_key",
+                    "no_usable_key",
+                    "API 服务没有可用的本地密钥".to_string(),
+                    None,
+                    None,
+                    now,
+                );
+            }
+            if collection.account_ids.is_empty() {
+                push_diagnostic_alert(
+                    &mut alerts,
+                    "error",
+                    "upstream",
+                    "empty_collection",
+                    "API 服务集合暂无上游账号".to_string(),
+                    None,
+                    None,
+                    now,
+                );
+            }
+        }
+        None => push_diagnostic_alert(
+            &mut alerts,
+            "error",
+            "service",
+            "missing_collection",
+            "API 服务集合尚未创建".to_string(),
+            None,
+            None,
+            now,
+        ),
+    }
+
+    if let Some(last_error) = runtime
+        .last_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        push_diagnostic_alert(
+            &mut alerts,
+            "error",
+            "service",
+            "last_error",
+            last_error.to_string(),
+            None,
+            None,
+            now,
+        );
+    }
+
+    for upstream in &upstreams {
+        if !upstream.selected {
+            continue;
+        }
+        if !upstream.eligible {
+            push_diagnostic_alert(
+                &mut alerts,
+                "warning",
+                "upstream",
+                upstream.account_id.as_str(),
+                format!("上游 {} 当前不符合 API 服务条件", upstream.email),
+                Some(upstream.account_id.clone()),
+                None,
+                now,
+            );
+        } else if upstream.cooling_down {
+            push_diagnostic_alert(
+                &mut alerts,
+                "warning",
+                "upstream",
+                upstream.account_id.as_str(),
+                format!("上游 {} 正在冷却中", upstream.email),
+                Some(upstream.account_id.clone()),
+                None,
+                now,
+            );
+        } else if upstream.consecutive_failures >= 3 {
+            push_diagnostic_alert(
+                &mut alerts,
+                "warning",
+                "upstream",
+                upstream.account_id.as_str(),
+                format!(
+                    "上游 {} 已连续失败 {} 次",
+                    upstream.email, upstream.consecutive_failures
+                ),
+                Some(upstream.account_id.clone()),
+                None,
+                now,
+            );
+        }
+    }
+
+    for api_key in &api_keys {
+        if !api_key.enabled {
+            continue;
+        }
+        if api_key.authorized_account_count == 0 {
+            push_diagnostic_alert(
+                &mut alerts,
+                "warning",
+                "api_key",
+                api_key.api_key_id.as_str(),
+                format!("密钥 {} 当前没有授权上游", api_key.api_key_name),
+                None,
+                Some(api_key.api_key_id.clone()),
+                now,
+            );
+        } else if api_key.available_account_count == 0 {
+            push_diagnostic_alert(
+                &mut alerts,
+                "warning",
+                "api_key",
+                api_key.api_key_id.as_str(),
+                format!("密钥 {} 授权的上游当前均不可用", api_key.api_key_name),
+                None,
+                Some(api_key.api_key_id.clone()),
+                now,
+            );
+        }
+        if api_key
+            .monthly_usage_ratio
+            .map(|ratio| ratio >= 0.9)
+            .unwrap_or(false)
+        {
+            push_diagnostic_alert(
+                &mut alerts,
+                "warning",
+                "api_key",
+                &format!("quota:{}", api_key.api_key_id),
+                format!("密钥 {} 已接近 30 天 Token 限额", api_key.api_key_name),
+                None,
+                Some(api_key.api_key_id.clone()),
+                now,
+            );
+        }
+    }
+
+    let usable_key_count = collection
+        .map(|collection| {
+            collection
+                .api_keys
+                .iter()
+                .filter(|api_key| is_usable_local_access_api_key(api_key))
+                .count()
+        })
+        .unwrap_or(0);
+    let selected_upstream_count = upstreams
+        .iter()
+        .filter(|upstream| upstream.selected)
+        .count();
+    let available_upstream_count = upstreams
+        .iter()
+        .filter(|upstream| {
+            upstream.selected && upstream.eligible && upstream.healthy && !upstream.cooling_down
+        })
+        .count();
+    let service_unavailable = collection.is_none()
+        || collection
+            .map(|collection| !collection.enabled)
+            .unwrap_or(true)
+        || !runtime.running
+        || usable_key_count == 0
+        || selected_upstream_count == 0
+        || available_upstream_count == 0
+        || runtime.last_error.is_some();
+    let has_warning = alerts
+        .iter()
+        .any(|alert| matches!(alert.severity.as_str(), "warning" | "error"));
+    let status = if service_unavailable {
+        "unavailable"
+    } else if has_warning {
+        "degraded"
+    } else {
+        "healthy"
+    }
+    .to_string();
+
+    let mut events = stats.diagnostic_events.clone();
+    events.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+
+    CodexLocalAccessDiagnostics {
+        status,
+        alerts,
+        upstreams,
+        api_keys,
+        events,
+    }
+}
+
+fn build_service_summary(
+    service: &GatewayServiceRuntime,
+    diagnostics: &CodexLocalAccessDiagnostics,
+) -> Option<CodexLocalAccessServiceSummary> {
+    let collection = service.collection.as_ref()?;
+    let default_api_key_name =
+        resolve_default_api_key(collection).map(|api_key| api_key.name.clone());
+    Some(CodexLocalAccessServiceSummary {
+        id: collection.id.clone(),
+        name: collection.name.clone(),
+        enabled: collection.enabled,
+        running: service.running,
+        port: collection.port,
+        api_port_url: build_api_port_url(collection.port),
+        base_url: build_base_url(collection.port),
+        member_count: collection.account_ids.len(),
+        api_key_count: collection.api_keys.len(),
+        default_api_key_name,
+        health_status: diagnostics.status.clone(),
+        alert_count: diagnostics.alerts.len(),
+        last_error: service.last_error.clone(),
+        updated_at: collection.updated_at,
+    })
+}
+
+fn build_state_snapshot_for_service(
+    runtime: &GatewayRuntime,
+    service_id: Option<&str>,
+) -> CodexLocalAccessState {
+    let selected_id = service_id
+        .map(str::to_string)
+        .or_else(|| selected_service_id(runtime));
+    let selected_service = selected_id
+        .as_deref()
+        .and_then(|id| runtime.services.get(id));
+    let collection = selected_service.and_then(|service| service.collection.clone());
     let member_count = collection
         .as_ref()
         .map(|item| item.account_ids.len())
@@ -3326,27 +4985,91 @@ fn build_state_snapshot(runtime: &GatewayRuntime) -> CodexLocalAccessState {
         .map(|item| build_api_port_url(item.port));
     let base_url = collection.as_ref().map(|item| build_base_url(item.port));
     let model_ids = supported_codex_model_ids();
-    let mut stats = runtime.stats.clone();
+    let upstream_sources = build_local_access_upstream_sources(collection.as_ref());
+    let diagnostics = selected_service
+        .map(|service| {
+            build_local_access_diagnostics(
+                service,
+                collection.as_ref(),
+                &upstream_sources,
+                &service.stats,
+            )
+        })
+        .unwrap_or_default();
+    let mut stats = selected_service
+        .map(|service| service.stats.clone())
+        .unwrap_or_else(empty_stats_snapshot);
     stats.events.clear();
+    stats.diagnostic_events.clear();
+    let running = selected_service
+        .map(|service| service.running)
+        .unwrap_or(false);
+    let last_error = selected_service.and_then(|service| service.last_error.clone());
+    let mut services = runtime
+        .services
+        .values()
+        .filter_map(|service| {
+            let collection = service.collection.as_ref()?;
+            let upstream_sources = build_local_access_upstream_sources(Some(collection));
+            let diagnostics = build_local_access_diagnostics(
+                service,
+                Some(collection),
+                &upstream_sources,
+                &service.stats,
+            );
+            build_service_summary(service, &diagnostics)
+        })
+        .collect::<Vec<_>>();
+    services.sort_by(|left, right| {
+        left.updated_at
+            .cmp(&right.updated_at)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 
     CodexLocalAccessState {
+        services,
+        selected_service_id: selected_id,
         collection,
-        running: runtime.running,
+        running,
         api_port_url,
         base_url,
         model_ids,
-        last_error: runtime.last_error.clone(),
+        last_error,
         member_count,
+        upstream_sources,
         stats,
+        diagnostics,
     }
+}
+
+fn build_state_snapshot(runtime: &GatewayRuntime) -> CodexLocalAccessState {
+    build_state_snapshot_for_service(runtime, None)
 }
 
 async fn snapshot_state() -> Result<CodexLocalAccessState, String> {
     ensure_runtime_loaded_without_start().await?;
-    if let Err(err) = ensure_gateway_matches_runtime().await {
-        let mut runtime = gateway_runtime().lock().await;
-        runtime.last_error = Some(err);
-        return Ok(build_state_snapshot(&runtime));
+    let enabled_service_ids = {
+        let runtime = gateway_runtime().lock().await;
+        runtime
+            .services
+            .iter()
+            .filter_map(|(service_id, service)| {
+                service
+                    .collection
+                    .as_ref()
+                    .filter(|collection| collection.enabled)
+                    .map(|_| service_id.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    for service_id in enabled_service_ids {
+        if let Err(err) = ensure_gateway_matches_runtime(Some(service_id.as_str())).await {
+            let mut runtime = gateway_runtime().lock().await;
+            if let Some(service) = runtime.services.get_mut(&service_id) {
+                service.last_error = Some(err);
+            }
+        }
     }
     let runtime = gateway_runtime().lock().await;
     Ok(build_state_snapshot(&runtime))
@@ -3356,45 +5079,180 @@ pub async fn get_local_access_state() -> Result<CodexLocalAccessState, String> {
     snapshot_state().await
 }
 
+async fn load_service_collection_for_update(
+    service_id: Option<&str>,
+) -> Result<(String, CodexLocalAccessCollection), String> {
+    ensure_runtime_loaded().await?;
+    let runtime = gateway_runtime().lock().await;
+    let resolved_service_id = resolve_service_id(&runtime, service_id)?;
+    let collection = runtime
+        .services
+        .get(&resolved_service_id)
+        .and_then(|service| service.collection.clone())
+        .ok_or_else(|| "API 服务不存在".to_string())?;
+    Ok((resolved_service_id, collection))
+}
+
+async fn persist_service_collection(
+    service_id: &str,
+    collection: CodexLocalAccessCollection,
+    reconcile_gateway: bool,
+) -> Result<(), String> {
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        let service = runtime
+            .services
+            .get_mut(service_id)
+            .ok_or_else(|| "API 服务不存在".to_string())?;
+        sync_runtime_collection(service, collection);
+        persist_runtime_config(&runtime)?;
+    }
+    if reconcile_gateway {
+        ensure_gateway_matches_runtime(Some(service_id)).await?;
+    }
+    Ok(())
+}
+
+pub async fn test_local_access_upstream(
+    service_id: Option<String>,
+    account_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let resolved_service_id = {
+        let runtime = gateway_runtime().lock().await;
+        resolve_service_id(&runtime, service_id.as_deref())?
+    };
+    let normalized_account_id = account_id.trim();
+    if normalized_account_id.is_empty() {
+        return Err("上游账号 ID 不能为空".to_string());
+    }
+    let account = codex_account::load_account(normalized_account_id)
+        .ok_or_else(|| format!("账号不存在: {}", normalized_account_id))?;
+    let collection = {
+        let runtime = gateway_runtime().lock().await;
+        runtime
+            .services
+            .get(&resolved_service_id)
+            .and_then(|service| service.collection.clone())
+    };
+    if let Some(collection) = collection.as_ref() {
+        if !is_local_access_eligible_account(&account, collection.restrict_free_accounts) {
+            let reason = build_disabled_reason_for_local_access_account(
+                &account,
+                collection.restrict_free_accounts,
+            )
+            .unwrap_or_else(|| "账号不符合 API 服务条件".to_string());
+            record_upstream_health_check_result(
+                &resolved_service_id,
+                &account,
+                false,
+                0,
+                None,
+                Some(reason.as_str()),
+                false,
+            )
+            .await?;
+            return snapshot_state().await;
+        }
+    }
+
+    let started_at = Instant::now();
+    if account.is_api_key_auth() {
+        match fetch_openai_compatible_models_checked(&account).await {
+            Ok(_) => {
+                record_upstream_health_check_result(
+                    &resolved_service_id,
+                    &account,
+                    true,
+                    started_at.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
+            }
+            Err(err) => {
+                record_upstream_health_check_result(
+                    &resolved_service_id,
+                    &account,
+                    false,
+                    started_at.elapsed().as_millis() as u64,
+                    err.status_code,
+                    Some(err.message.as_str()),
+                    err.retryable,
+                )
+                .await?;
+            }
+        }
+    } else {
+        match get_prepared_account(&resolved_service_id, normalized_account_id).await {
+            Ok(prepared) => {
+                record_upstream_health_check_result(
+                    &resolved_service_id,
+                    &prepared,
+                    true,
+                    started_at.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
+            }
+            Err(err) => {
+                invalidate_prepared_account(&resolved_service_id, normalized_account_id).await;
+                record_upstream_health_check_result(
+                    &resolved_service_id,
+                    &account,
+                    false,
+                    started_at.elapsed().as_millis() as u64,
+                    None,
+                    Some(err.as_str()),
+                    true,
+                )
+                .await?;
+            }
+        }
+    }
+
+    snapshot_state().await
+}
+
 pub async fn activate_local_access_for_dir(
+    service_id: Option<String>,
     profile_dir: &Path,
 ) -> Result<CodexLocalAccessState, String> {
-    let state = set_local_access_enabled(true).await?;
-    let collection = state
-        .collection
-        .clone()
-        .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
-    let base_url = state
-        .base_url
-        .clone()
-        .unwrap_or_else(|| build_base_url(collection.port));
-    let runtime_account = build_runtime_account(base_url, collection.api_key.clone());
+    ensure_runtime_loaded_without_start().await?;
+    let resolved_service_id = {
+        let runtime = gateway_runtime().lock().await;
+        resolve_service_id(&runtime, service_id.as_deref())?
+    };
+    set_local_access_enabled(Some(resolved_service_id.clone()), true).await?;
+    let collection = {
+        let mut runtime = gateway_runtime().lock().await;
+        runtime.selected_service_id = Some(resolved_service_id.clone());
+        let collection = runtime
+            .services
+            .get(&resolved_service_id)
+            .and_then(|service| service.collection.clone())
+            .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
+        persist_runtime_config(&runtime)?;
+        collection
+    };
+    let base_url = build_base_url(collection.port);
+    let api_key = resolve_default_api_key(&collection)
+        .ok_or_else(|| "API 服务没有可用密钥，请先启用或创建一个密钥".to_string())?;
+    let runtime_account = build_runtime_account(base_url, api_key.key.clone());
     codex_account::write_account_bundle_to_dir(profile_dir, &runtime_account)?;
-    Ok(state)
+    snapshot_state().await
 }
 
 pub async fn save_local_access_accounts(
+    service_id: Option<String>,
     account_ids: Vec<String>,
     restrict_free_accounts: bool,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
-
-    let mut collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime
-            .collection
-            .clone()
-            .unwrap_or(CodexLocalAccessCollection {
-                enabled: false,
-                port: allocate_random_local_port()?,
-                api_key: generate_local_api_key(),
-                routing_strategy: CodexLocalAccessRoutingStrategy::default(),
-                restrict_free_accounts: true,
-                account_ids: Vec::new(),
-                created_at: now_ms(),
-                updated_at: now_ms(),
-            })
-    };
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
 
     let valid_account_ids: HashSet<String> = codex_account::list_accounts_checked()?
         .into_iter()
@@ -3420,30 +5278,16 @@ pub async fn save_local_access_accounts(
     if changed {
         collection.updated_at = now_ms();
     }
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
-
-    ensure_gateway_matches_runtime().await?;
+    persist_service_collection(&resolved_service_id, collection, true).await?;
     snapshot_state().await
 }
 
 pub async fn update_local_access_routing_strategy(
+    service_id: Option<String>,
     strategy: CodexLocalAccessRoutingStrategy,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
-
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
 
     if collection.routing_strategy == strategy {
         return snapshot_state().await;
@@ -3451,29 +5295,16 @@ pub async fn update_local_access_routing_strategy(
 
     collection.routing_strategy = strategy;
     collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
-
+    persist_service_collection(&resolved_service_id, collection, false).await?;
     snapshot_state().await
 }
 
 pub async fn remove_local_access_account(
+    service_id: Option<String>,
     account_id: &str,
 ) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
-
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return snapshot_state().await;
-    };
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
 
     let before_len = collection.account_ids.len();
     collection.account_ids.retain(|id| id != account_id);
@@ -3482,49 +5313,309 @@ pub async fn remove_local_access_account(
     }
 
     collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
+    let (changed, _) = sanitize_collection(&mut collection)?;
+    if changed {
+        collection.updated_at = now_ms();
     }
-
-    ensure_gateway_matches_runtime().await?;
+    persist_service_collection(&resolved_service_id, collection, true).await?;
     snapshot_state().await
 }
 
-pub async fn rotate_local_access_api_key() -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+pub async fn create_local_access_api_key(
+    service_id: Option<String>,
+    name: String,
+    monthly_token_limit: Option<u64>,
+    upstream_scope: Option<String>,
+    allowed_account_ids: Option<Vec<String>>,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
 
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
-
-    collection.api_key = generate_local_api_key();
+    let fallback_name = format!("API Key {}", collection.api_keys.len().saturating_add(1));
+    let resolved_allowed_account_ids = resolve_local_api_key_allowed_account_ids(
+        upstream_scope.as_deref(),
+        allowed_account_ids,
+        &collection.account_ids,
+        None,
+    )?;
+    let api_key = build_local_api_key(
+        if name.trim().is_empty() {
+            fallback_name.as_str()
+        } else {
+            name.as_str()
+        },
+        None,
+        monthly_token_limit,
+        resolved_allowed_account_ids,
+    );
+    collection.api_keys.push(api_key);
     collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
+    let (changed, _) = sanitize_collection(&mut collection)?;
+    if changed {
+        collection.updated_at = now_ms();
     }
-
+    persist_service_collection(&resolved_service_id, collection, false).await?;
     snapshot_state().await
 }
 
-pub async fn clear_local_access_stats() -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
+pub async fn update_local_access_api_key(
+    service_id: Option<String>,
+    api_key_id: String,
+    name: String,
+    enabled: bool,
+    monthly_token_limit: Option<u64>,
+    upstream_scope: Option<String>,
+    allowed_account_ids: Option<Vec<String>>,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
+    let normalized_id = api_key_id.trim();
+    let collection_account_ids = collection.account_ids.clone();
+    let Some(api_key) = collection
+        .api_keys
+        .iter_mut()
+        .find(|item| item.id == normalized_id)
+    else {
+        return Err("API 服务密钥不存在".to_string());
+    };
+
+    api_key.name = normalize_local_api_key_name(&name);
+    api_key.enabled = enabled;
+    api_key.monthly_token_limit = normalize_monthly_token_limit(monthly_token_limit);
+    api_key.allowed_account_ids = resolve_local_api_key_allowed_account_ids(
+        upstream_scope.as_deref(),
+        allowed_account_ids,
+        &collection_account_ids,
+        Some(api_key.allowed_account_ids.clone()),
+    )?;
+    api_key.updated_at = now_ms();
+    collection.updated_at = now_ms();
+    let (changed, _) = sanitize_collection(&mut collection)?;
+    if changed {
+        collection.updated_at = now_ms();
+    }
+    persist_service_collection(&resolved_service_id, collection, false).await?;
+    snapshot_state().await
+}
+
+pub async fn set_local_access_default_api_key(
+    service_id: Option<String>,
+    api_key_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
+    let normalized_id = api_key_id.trim();
+    if normalized_id.is_empty() {
+        return Err("API 服务密钥不存在".to_string());
+    }
+    let Some(api_key) = collection
+        .api_keys
+        .iter()
+        .find(|item| item.id == normalized_id)
+    else {
+        return Err("API 服务密钥不存在".to_string());
+    };
+    if !is_usable_local_access_api_key(api_key) {
+        return Err("只能将已启用的 API 服务密钥设为默认".to_string());
+    }
+
+    collection.default_api_key_id = Some(api_key.id.clone());
+    collection.updated_at = now_ms();
+    let (changed, _) = sanitize_collection(&mut collection)?;
+    if changed {
+        collection.updated_at = now_ms();
+    }
+    persist_service_collection(&resolved_service_id, collection, false).await?;
+    snapshot_state().await
+}
+
+pub async fn rotate_local_access_api_key(
+    service_id: Option<String>,
+    api_key_id: Option<&str>,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
+
+    let target_id = api_key_id.map(str::trim).filter(|value| !value.is_empty());
+    let target_index = match target_id {
+        Some(target_id) => collection
+            .api_keys
+            .iter()
+            .position(|item| item.id == target_id),
+        None => collection
+            .api_keys
+            .iter()
+            .position(|item| item.enabled)
+            .or_else(|| (!collection.api_keys.is_empty()).then_some(0)),
+    }
+    .ok_or_else(|| "API 服务密钥不存在".to_string())?;
+
+    collection.api_keys[target_index].key = generate_local_api_key();
+    collection.api_keys[target_index].last_used_at = None;
+    collection.api_keys[target_index].updated_at = now_ms();
+    collection.updated_at = now_ms();
+    persist_service_collection(&resolved_service_id, collection, false).await?;
+    snapshot_state().await
+}
+
+pub async fn delete_local_access_api_key(
+    service_id: Option<String>,
+    api_key_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
+    if collection.api_keys.len() <= 1 {
+        return Err("至少保留一个 API 服务密钥".to_string());
+    }
+
+    let normalized_id = api_key_id.trim();
+    let before_len = collection.api_keys.len();
+    collection.api_keys.retain(|item| item.id != normalized_id);
+    if collection.api_keys.len() == before_len {
+        return Err("API 服务密钥不存在".to_string());
+    }
+
+    collection.updated_at = now_ms();
+    let (changed, _) = sanitize_collection(&mut collection)?;
+    if changed {
+        collection.updated_at = now_ms();
+    }
+    persist_service_collection(&resolved_service_id, collection, false).await?;
+    snapshot_state().await
+}
+
+pub async fn create_local_access_service(
+    name: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let mut collection = {
+        let runtime = gateway_runtime().lock().await;
+        let next_index = runtime.services.len().saturating_add(1);
+        let service_name = name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("API 服务 {}", next_index));
+        let mut candidate =
+            new_local_access_collection(generate_local_access_service_id(), service_name.as_str())?;
+        let used_ports: HashSet<u16> = runtime
+            .services
+            .values()
+            .filter_map(|service| {
+                service
+                    .collection
+                    .as_ref()
+                    .map(|collection| collection.port)
+            })
+            .collect();
+        while used_ports.contains(&candidate.port) {
+            candidate.port = allocate_random_local_port()?;
+        }
+        candidate
+    };
+    let (changed, _) = sanitize_collection(&mut collection)?;
+    if changed {
+        collection.updated_at = now_ms();
+    }
+    let service_id = collection.id.clone();
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        runtime.services.insert(
+            service_id.clone(),
+            service_runtime_from_collection(collection, empty_stats_snapshot()),
+        );
+        runtime.selected_service_id = Some(service_id);
+        persist_runtime_config(&runtime)?;
+    }
+    snapshot_state().await
+}
+
+pub async fn rename_local_access_service(
+    service_id: String,
+    name: String,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(Some(service_id.as_str())).await?;
+    collection.name = normalize_local_access_service_name(&name);
+    collection.updated_at = now_ms();
+    persist_service_collection(&resolved_service_id, collection, false).await?;
+    snapshot_state().await
+}
+
+pub async fn select_local_access_service(
+    service_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let normalized = service_id.trim().to_string();
+    if normalized.is_empty() {
+        return Err("API 服务不存在".to_string());
+    }
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        if !runtime.services.contains_key(&normalized) {
+            return Err("API 服务不存在".to_string());
+        }
+        runtime.selected_service_id = Some(normalized);
+        persist_runtime_config(&runtime)?;
+    }
+    snapshot_state().await
+}
+
+pub async fn delete_local_access_service(
+    service_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let normalized = service_id.trim().to_string();
+    if normalized.is_empty() {
+        return Err("API 服务不存在".to_string());
+    }
+    {
+        let runtime = gateway_runtime().lock().await;
+        if runtime.services.len() <= 1 {
+            return Err("至少保留一个 API 服务".to_string());
+        }
+        if !runtime.services.contains_key(&normalized) {
+            return Err("API 服务不存在".to_string());
+        }
+    }
+    stop_gateway(Some(normalized.as_str())).await;
+    {
+        let mut runtime = gateway_runtime().lock().await;
+        runtime.services.remove(&normalized);
+        if runtime.selected_service_id.as_deref() == Some(normalized.as_str()) {
+            runtime.selected_service_id = selected_service_id(&runtime);
+        }
+        persist_runtime_config(&runtime)?;
+        let stats_by_service_id = runtime
+            .services
+            .iter()
+            .map(|(service_id, service)| (service_id.clone(), service.stats.clone()))
+            .collect();
+        save_stats_store_to_disk(&CodexLocalAccessStatsStore {
+            stats_by_service_id,
+        })?;
+    }
+    snapshot_state().await
+}
+
+pub async fn clear_local_access_stats(
+    service_id: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    ensure_runtime_loaded_without_start().await?;
+    let resolved_service_id = {
+        let runtime = gateway_runtime().lock().await;
+        resolve_service_id(&runtime, service_id.as_deref())?
+    };
 
     let cleared = empty_stats_snapshot();
     {
         let mut runtime = gateway_runtime().lock().await;
-        runtime.stats = cleared;
-        runtime.stats_dirty = true;
+        let service = runtime
+            .services
+            .get_mut(&resolved_service_id)
+            .ok_or_else(|| "API 服务不存在".to_string())?;
+        service.stats = cleared;
+        service.stats_dirty = true;
     }
     schedule_stats_flush_if_needed().await;
 
@@ -3533,14 +5624,21 @@ pub async fn clear_local_access_stats() -> Result<CodexLocalAccessState, String>
 
 pub async fn prepare_local_access_gateway_for_restart() -> Result<CodexLocalAccessState, String> {
     ensure_runtime_loaded_without_start().await?;
-    stop_gateway().await;
+    let service_ids = {
+        let runtime = gateway_runtime().lock().await;
+        runtime.services.keys().cloned().collect::<Vec<_>>()
+    };
+    for service_id in service_ids {
+        stop_gateway(Some(service_id.as_str())).await;
+    }
 
     let runtime = gateway_runtime().lock().await;
     Ok(build_state_snapshot(&runtime))
 }
 
-pub async fn kill_local_access_port_processes() -> Result<CodexLocalAccessPortCleanupResult, String>
-{
+pub async fn kill_local_access_port_processes(
+    service_id: Option<String>,
+) -> Result<CodexLocalAccessPortCleanupResult, String> {
     if let Err(err) = ensure_runtime_loaded_without_start().await {
         logger::log_codex_api_warn(&format!(
             "[CodexLocalAccess] 清理端口前加载配置失败: {}",
@@ -3549,18 +5647,23 @@ pub async fn kill_local_access_port_processes() -> Result<CodexLocalAccessPortCl
         return Err(err);
     }
 
-    let collection = {
+    let (resolved_service_id, collection) = {
         let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    }
-    .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
+        let resolved_service_id = resolve_service_id(&runtime, service_id.as_deref())?;
+        let collection = runtime
+            .services
+            .get(&resolved_service_id)
+            .and_then(|service| service.collection.clone())
+            .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
+        (resolved_service_id, collection)
+    };
 
-    stop_gateway().await;
+    stop_gateway(Some(resolved_service_id.as_str())).await;
 
     let killed_count = process::kill_port_processes(collection.port)? as u32;
 
     if collection.enabled {
-        ensure_gateway_matches_runtime().await?;
+        ensure_gateway_matches_runtime(Some(resolved_service_id.as_str())).await?;
     }
 
     let state = snapshot_state().await?;
@@ -3570,17 +5673,25 @@ pub async fn kill_local_access_port_processes() -> Result<CodexLocalAccessPortCl
     })
 }
 
-pub async fn update_local_access_port(port: u16) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
-
-    let maybe_collection = {
+pub async fn update_local_access_port(
+    service_id: Option<String>,
+    port: u16,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
+    {
         let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
+        if runtime.services.iter().any(|(other_service_id, service)| {
+            other_service_id != &resolved_service_id
+                && service
+                    .collection
+                    .as_ref()
+                    .map(|collection| collection.port == port)
+                    .unwrap_or(false)
+        }) {
+            return Err(format!("端口 {} 已被其他 API 服务使用", port));
+        }
+    }
 
     ensure_local_port_available(port, Some(collection.port))?;
     if collection.port == port {
@@ -3589,39 +5700,20 @@ pub async fn update_local_access_port(port: u16) -> Result<CodexLocalAccessState
 
     collection.port = port;
     collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
-
-    ensure_gateway_matches_runtime().await?;
+    persist_service_collection(&resolved_service_id, collection, true).await?;
     snapshot_state().await
 }
 
-pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
-
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
+pub async fn set_local_access_enabled(
+    service_id: Option<String>,
+    enabled: bool,
+) -> Result<CodexLocalAccessState, String> {
+    let (resolved_service_id, mut collection) =
+        load_service_collection_for_update(service_id.as_deref()).await?;
 
     collection.enabled = enabled;
     collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
-
-    ensure_gateway_matches_runtime().await?;
+    persist_service_collection(&resolved_service_id, collection, true).await?;
     snapshot_state().await
 }
 
@@ -3629,7 +5721,12 @@ pub async fn restore_local_access_gateway() {
     if let Err(err) = ensure_runtime_loaded().await {
         let mut runtime = gateway_runtime().lock().await;
         runtime.loaded = true;
-        runtime.last_error = Some(err.clone());
+        let selected = selected_service_id(&runtime);
+        if let Some(service_id) = selected {
+            if let Some(service) = runtime.services.get_mut(&service_id) {
+                service.last_error = Some(err.clone());
+            }
+        }
         logger::log_codex_api_warn(&format!("[CodexLocalAccess] 初始化失败: {}", err));
     }
 }
@@ -3797,6 +5894,191 @@ fn build_local_models_response() -> Value {
     })
 }
 
+async fn fetch_openai_compatible_models_checked(
+    account: &CodexAccount,
+) -> Result<Vec<String>, UpstreamModelsFetchFailure> {
+    let cache_key = format!(
+        "{}:{}",
+        account.id,
+        normalize_api_base_url_for_gateway(account.api_base_url.as_deref())
+    );
+    let now = now_ms();
+    {
+        let cache = upstream_models_cache().lock().await;
+        if let Some(cached) = cache.get(&cache_key) {
+            if now.saturating_sub(cached.fetched_at_ms) <= UPSTREAM_MODELS_CACHE_TTL_MS {
+                return Ok(cached.model_ids.clone());
+            }
+        }
+    }
+
+    let url = match build_openai_compatible_upstream_url(account, "/v1/models") {
+        Ok(url) => url,
+        Err(err) => {
+            return Err(UpstreamModelsFetchFailure {
+                message: err,
+                status_code: None,
+                retryable: false,
+            });
+        }
+    };
+    let api_key = match account
+        .openai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return Err(UpstreamModelsFetchFailure {
+                message: "API Key 账号缺少可用密钥".to_string(),
+                status_code: None,
+                retryable: false,
+            });
+        }
+    };
+
+    let client = upstream_http_client();
+    let result = timeout(
+        UPSTREAM_MODELS_FETCH_TIMEOUT,
+        client.get(url).bearer_auth(api_key).send(),
+    )
+    .await;
+    let response = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            return Err(UpstreamModelsFetchFailure {
+                message: format!("获取模型列表失败: {}", err),
+                status_code: None,
+                retryable: should_retry_upstream_send_error(&err),
+            });
+        }
+        Err(_) => {
+            return Err(UpstreamModelsFetchFailure {
+                message: "获取模型列表超时".to_string(),
+                status_code: None,
+                retryable: true,
+            });
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(UpstreamModelsFetchFailure {
+            message: summarize_upstream_error(status, &body),
+            status_code: Some(status.as_u16()),
+            retryable: should_try_next_openai_compatible_account(status, &body),
+        });
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|err| UpstreamModelsFetchFailure {
+            message: format!("解析模型列表失败: {}", err),
+            status_code: None,
+            retryable: false,
+        })?;
+    let mut seen = HashSet::new();
+    let model_ids: Vec<String> = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .filter(|model| seen.insert(model.to_ascii_lowercase()))
+        .map(str::to_string)
+        .collect();
+
+    let mut cache = upstream_models_cache().lock().await;
+    cache.insert(
+        cache_key,
+        CachedUpstreamModels {
+            model_ids: model_ids.clone(),
+            fetched_at_ms: now_ms(),
+        },
+    );
+
+    Ok(model_ids)
+}
+
+async fn fetch_openai_compatible_models(account: &CodexAccount) -> Vec<String> {
+    let metadata = build_source_metadata(account);
+    match fetch_openai_compatible_models_checked(account).await {
+        Ok(model_ids) => model_ids,
+        Err(err) => {
+            logger::log_codex_api_warn(&format!(
+                "[CodexLocalAccess] 获取 {} 模型列表失败: {}",
+                metadata
+                    .provider_name
+                    .as_deref()
+                    .unwrap_or("OpenAI 兼容上游"),
+                err.message
+            ));
+            Vec::new()
+        }
+    }
+}
+
+async fn build_local_models_response_for_collection(
+    collection: &CodexLocalAccessCollection,
+    account_ids: &[String],
+) -> Value {
+    let mut seen = HashSet::new();
+    let mut model_ids = Vec::new();
+    let mut has_codex_oauth_account = false;
+    let mut openai_compatible_models = Vec::new();
+
+    for account_id in account_ids {
+        let Some(account) = codex_account::load_account(account_id) else {
+            continue;
+        };
+        if !is_local_access_eligible_account(&account, collection.restrict_free_accounts) {
+            continue;
+        }
+        if account.is_api_key_auth() {
+            for model in fetch_openai_compatible_models(&account).await {
+                openai_compatible_models.push(model);
+            }
+        } else {
+            has_codex_oauth_account = true;
+        }
+    }
+
+    if has_codex_oauth_account {
+        for model in supported_codex_model_ids() {
+            if seen.insert(model.to_ascii_lowercase()) {
+                model_ids.push(model);
+            }
+        }
+    }
+
+    for model in openai_compatible_models {
+        if seen.insert(model.to_ascii_lowercase()) {
+            model_ids.push(model);
+        }
+    }
+
+    let data: Vec<Value> = model_ids
+        .into_iter()
+        .map(|model| {
+            json!({
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            })
+        })
+        .collect();
+
+    json!({
+        "object": "list",
+        "data": data,
+    })
+}
+
 fn usage_number(value: Option<&Value>) -> Option<u64> {
     value.and_then(Value::as_u64).or_else(|| {
         value
@@ -3892,9 +6174,7 @@ fn extract_usage_capture(value: &Value) -> Option<UsageCapture> {
         input_tokens,
         output_tokens,
         total_tokens: if explicit_total_tokens.unwrap_or(0) == 0 {
-            input_tokens
-                .saturating_add(output_tokens)
-                .saturating_add(reasoning_tokens)
+            input_tokens.saturating_add(output_tokens.max(reasoning_tokens))
         } else {
             explicit_total_tokens.unwrap_or(0)
         },
@@ -4364,17 +6644,9 @@ fn parse_responses_payload_from_upstream(body_bytes: &[u8]) -> Result<Value, Str
             return;
         }
         let text = String::from_utf8_lossy(frame);
-        let mut event_name: Option<String> = None;
         let mut data_lines = Vec::new();
         for raw_line in text.lines() {
             let line = raw_line.trim();
-            if let Some(rest) = line.strip_prefix("event:") {
-                let value = rest.trim();
-                if !value.is_empty() {
-                    event_name = Some(value.to_string());
-                }
-                continue;
-            }
             if let Some(rest) = line.strip_prefix("data:") {
                 let payload = rest.trim();
                 if !payload.is_empty() {
@@ -4399,12 +6671,7 @@ fn parse_responses_payload_from_upstream(body_bytes: &[u8]) -> Result<Value, Str
         let Ok(value) = serde_json::from_str::<Value>(&payload) else {
             return;
         };
-        match value
-            .get("type")
-            .and_then(Value::as_str)
-            .or(event_name.as_deref())
-            .unwrap_or("")
-        {
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
             "response.output_text.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
                     output_text.push_str(delta);
@@ -4422,7 +6689,7 @@ fn parse_responses_payload_from_upstream(body_bytes: &[u8]) -> Result<Value, Str
                     output_items.push(item.clone());
                 }
             }
-            event_type if is_responses_completion_event(event_type) => {
+            "response.completed" => {
                 if let Some(response) = value.get("response") {
                     completed_response = Some(response.clone());
                 } else {
@@ -4446,10 +6713,7 @@ fn parse_responses_payload_from_upstream(body_bytes: &[u8]) -> Result<Value, Str
     }
 
     let Some(response_value) = completed_response else {
-        return Err(
-            "解析上游 responses 响应失败: 非 JSON 且未捕获 response.completed/response.done"
-                .to_string(),
-        );
+        return Err("解析上游 responses 响应失败: 非 JSON 且未捕获 response.completed".to_string());
     };
 
     let mut root = Map::new();
@@ -4708,17 +6972,9 @@ impl ImageStreamTransformer {
         }
 
         let text = String::from_utf8_lossy(frame);
-        let mut event_name: Option<String> = None;
         let mut data_lines = Vec::new();
         for raw_line in text.lines() {
             let line = raw_line.trim();
-            if let Some(rest) = line.strip_prefix("event:") {
-                let value = rest.trim();
-                if !value.is_empty() {
-                    event_name = Some(value.to_string());
-                }
-                continue;
-            }
             if let Some(rest) = line.strip_prefix("data:") {
                 let payload = rest.trim();
                 if !payload.is_empty() {
@@ -4751,12 +7007,7 @@ impl ImageStreamTransformer {
             self.response_capture.response_id = extract_response_id(&event);
         }
 
-        match event
-            .get("type")
-            .and_then(Value::as_str)
-            .or(event_name.as_deref())
-            .unwrap_or("")
-        {
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
             "response.image_generation_call.partial_image" => {
                 let Some(b64) = event
                     .get("partial_image_b64")
@@ -4791,7 +7042,7 @@ impl ImageStreamTransformer {
                 }
                 push_named_sse_payload(stream_body, &event_name, Value::Object(data));
             }
-            event_type if is_responses_completion_event(event_type) => {
+            "response.completed" => {
                 let (results, _, usage, _) = extract_images_from_responses_payload(&event);
                 if results.is_empty() {
                     push_named_sse_payload(
@@ -5017,10 +7268,13 @@ async fn write_upstream_response(
     Ok(usage_collector.finish())
 }
 
-async fn force_refresh_gateway_account(account_id: &str) -> Result<CodexAccount, String> {
+async fn force_refresh_gateway_account(
+    service_id: &str,
+    account_id: &str,
+) -> Result<CodexAccount, String> {
     let account =
         codex_account::force_refresh_managed_account(account_id, "本地网关上游返回 401").await?;
-    cache_prepared_account(&account).await;
+    cache_prepared_account(service_id, &account).await;
     Ok(account)
 }
 
@@ -5040,6 +7294,158 @@ fn upstream_send_retry_delay(retry_attempt: usize) -> Duration {
     } else {
         delay
     }
+}
+
+fn openai_compatible_target_suffix(base_url: &str, target: &str) -> String {
+    let normalized_base = base_url.trim_end_matches('/').to_ascii_lowercase();
+    if normalized_base.ends_with("/v1") {
+        let trimmed = target.trim_start_matches("/v1");
+        if trimmed.is_empty() {
+            "/".to_string()
+        } else if trimmed.starts_with('/') || trimmed.starts_with('?') {
+            trimmed.to_string()
+        } else {
+            format!("/{}", trimmed)
+        }
+    } else if target.starts_with('/') {
+        target.to_string()
+    } else {
+        format!("/{}", target)
+    }
+}
+
+fn build_openai_compatible_upstream_url(
+    account: &CodexAccount,
+    target: &str,
+) -> Result<String, String> {
+    if !target.starts_with("/v1") {
+        return Err("仅支持 /v1 路径".to_string());
+    }
+
+    let base_url = normalize_api_base_url_for_gateway(account.api_base_url.as_deref());
+    let suffix = openai_compatible_target_suffix(&base_url, target);
+    Ok(format!("{}{}", base_url.trim_end_matches('/'), suffix))
+}
+
+fn should_forward_openai_compatible_header(name: &str) -> bool {
+    !matches!(
+        name,
+        "authorization"
+            | "host"
+            | "content-length"
+            | "connection"
+            | "accept-encoding"
+            | "x-api-key"
+            | "chatgpt-account-id"
+            | "originator"
+            | "session_id"
+            | "x-codex-beta-features"
+    )
+}
+
+fn build_openai_compatible_upstream_headers(
+    headers: &HashMap<String, String>,
+    api_key: &str,
+) -> Result<HashMap<String, String>, String> {
+    let normalized_key = api_key.trim();
+    if normalized_key.is_empty() {
+        return Err("API Key 账号缺少可用密钥".to_string());
+    }
+
+    let mut next = HashMap::new();
+    for (name, value) in headers {
+        if !should_forward_openai_compatible_header(name.as_str()) {
+            continue;
+        }
+        next.insert(name.clone(), value.clone());
+    }
+    next.insert(
+        "authorization".to_string(),
+        format!("Bearer {}", normalized_key),
+    );
+    Ok(next)
+}
+
+fn prepare_openai_compatible_gateway_request(
+    request: ParsedRequest,
+) -> Result<(ParsedRequest, GatewayResponseAdapter), String> {
+    if !request.target.starts_with("/v1/") && request.target != "/v1" {
+        return Err("仅支持 /v1 路径".to_string());
+    }
+    let request_is_stream = is_stream_request(&request.headers, &request.body);
+    Ok((
+        request,
+        GatewayResponseAdapter::Passthrough { request_is_stream },
+    ))
+}
+
+fn request_model_is_supported_by_codex(request: &ParsedRequest) -> bool {
+    let model = extract_request_model_id(request);
+    if model.trim().is_empty() {
+        return true;
+    }
+    is_supported_codex_model_id(model.as_str())
+}
+
+fn should_try_next_openai_compatible_account(status: StatusCode, body: &str) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) || should_try_next_account(status, body)
+}
+
+async fn send_openai_compatible_upstream_request(
+    method: &str,
+    target: &str,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+    account: &CodexAccount,
+) -> Result<reqwest::Response, String> {
+    let method =
+        Method::from_bytes(method.as_bytes()).map_err(|e| format!("不支持的请求方法: {}", e))?;
+    let url = build_openai_compatible_upstream_url(account, target)?;
+    let api_key = account
+        .openai_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("API Key 账号缺少可用密钥")?;
+    let sanitized_headers = build_openai_compatible_upstream_headers(headers, api_key)?;
+    let client = upstream_http_client();
+
+    for retry_attempt in 0..=UPSTREAM_SEND_RETRY_ATTEMPTS {
+        let mut request = client.request(method.clone(), &url);
+        for (name, value) in &sanitized_headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| format!("无效请求头 {}: {}", name, e))?;
+            let header_value = HeaderValue::from_str(value)
+                .map_err(|e| format!("无效请求头值 {}: {}", name, e))?;
+            request = request.header(header_name, header_value);
+        }
+        if !sanitized_headers.contains_key("accept") {
+            request = request.header(ACCEPT, "application/json");
+        }
+        if !sanitized_headers.contains_key("content-type") && !body.is_empty() {
+            request = request.header(CONTENT_TYPE, "application/json");
+        }
+        if !body.is_empty() {
+            request = request.body(body.to_vec());
+        }
+
+        match request.send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let should_retry = retry_attempt < UPSTREAM_SEND_RETRY_ATTEMPTS
+                    && should_retry_upstream_send_error(&error);
+                if !should_retry {
+                    return Err(format!("请求 OpenAI 兼容上游失败: {}", error));
+                }
+                tokio::time::sleep(upstream_send_retry_delay(retry_attempt + 1)).await;
+            }
+        }
+    }
+
+    Err("请求 OpenAI 兼容上游失败: 未知错误".to_string())
 }
 
 fn should_retry_single_account_upstream_status(status: StatusCode) -> bool {
@@ -5148,8 +7554,10 @@ async fn send_upstream_request(
 }
 
 async fn proxy_request_with_account_pool(
+    service_id: &str,
     request: &ParsedRequest,
     collection: &CodexLocalAccessCollection,
+    account_ids: &[String],
 ) -> Result<ProxyDispatchSuccess, ProxyDispatchError> {
     if collection.account_ids.is_empty() {
         return Err(ProxyDispatchError {
@@ -5157,40 +7565,48 @@ async fn proxy_request_with_account_pool(
             message: "本地接入集合暂无账号".to_string(),
             account_id: None,
             account_email: None,
+            source_metadata: None,
+        });
+    }
+    if account_ids.is_empty() {
+        return Err(ProxyDispatchError {
+            status: 403,
+            message: "API 服务密钥没有可用上游账号".to_string(),
+            account_id: None,
+            account_email: None,
+            source_metadata: None,
         });
     }
 
-    let upstream_target =
-        resolve_upstream_target(&request.target).map_err(|err| ProxyDispatchError {
-            status: 400,
-            message: err,
-            account_id: None,
-            account_email: None,
-        })?;
     let routing_hint = build_request_routing_hint(request);
-    let total = collection.account_ids.len();
+    let codex_model_supported = request_model_is_supported_by_codex(request);
+    let total = account_ids.len();
     let max_credential_attempts = total.min(MAX_RETRY_CREDENTIALS_PER_REQUEST).max(1);
     let affinity_account_id = match routing_hint.previous_response_id.as_deref() {
-        Some(previous_response_id) => resolve_affinity_account(previous_response_id).await,
+        Some(previous_response_id) => resolve_affinity_account(service_id, previous_response_id)
+            .await
+            .filter(|account_id| account_ids.iter().any(|item| item == account_id)),
         None => None,
     };
     let mut last_status = 503u16;
     let mut last_error = "本地接入集合暂无可用账号".to_string();
     let mut last_account_id: Option<String> = None;
     let mut last_account_email: Option<String> = None;
+    let mut last_source_metadata: Option<LocalAccessSourceMetadata> = None;
     let mut attempts = 0usize;
     let mut retry_round = 0usize;
     let mut earliest_cooldown_wait: Option<Duration>;
 
     loop {
         let start = GATEWAY_ROUND_ROBIN_CURSOR.fetch_add(1, Ordering::Relaxed);
-        let ordered_account_ids = build_ordered_account_ids(
-            &collection.account_ids,
-            start,
-            affinity_account_id.as_deref(),
-        );
+        let ordered_account_ids =
+            build_ordered_account_ids(account_ids, start, affinity_account_id.as_deref());
         let strategy_account_ids = pin_account_to_front(
-            apply_routing_strategy(&ordered_account_ids, collection.routing_strategy),
+            apply_routing_strategy(
+                service_id,
+                &ordered_account_ids,
+                collection.routing_strategy,
+            ),
             affinity_account_id.as_deref(),
         );
         let mut attempted_in_round = false;
@@ -5201,7 +7617,8 @@ async fn proxy_request_with_account_pool(
                 break;
             }
 
-            if let Some(wait) = get_model_cooldown_wait(&account_id, &routing_hint.model_key).await
+            if let Some(wait) =
+                get_model_cooldown_wait(service_id, &account_id, &routing_hint.model_key).await
             {
                 round_cooldown_wait = Some(match round_cooldown_wait {
                     Some(current) if current <= wait => current,
@@ -5210,41 +7627,76 @@ async fn proxy_request_with_account_pool(
                 continue;
             }
 
-            attempted_in_round = true;
-            attempts += 1;
-
-            let mut account = match get_prepared_account(&account_id).await {
-                Ok(account) => account,
-                Err(err) => {
-                    invalidate_prepared_account(&account_id).await;
-                    log_codex_api_failure(
-                        None,
-                        Some(request),
-                        None,
-                        Some(account_id.as_str()),
-                        None,
-                        None,
-                        format!("账号预处理失败: {}", err).as_str(),
-                    );
-                    last_error = err;
-                    continue;
-                }
-            };
-
-            if account.is_api_key_auth() {
+            let Some(raw_account) = codex_account::load_account(&account_id) else {
                 log_codex_api_failure(
                     None,
                     Some(request),
                     None,
-                    Some(account.id.as_str()),
-                    Some(account.email.as_str()),
+                    Some(account_id.as_str()),
                     None,
-                    "API Key 账号不支持加入本地接入",
+                    None,
+                    "账号不存在或无法读取",
                 );
-                last_error = "API Key 账号不支持加入本地接入".to_string();
+                last_error = "账号不存在或无法读取".to_string();
+                continue;
+            };
+
+            let is_openai_compatible = raw_account.is_api_key_auth();
+            let source_metadata = build_source_metadata(&raw_account);
+
+            if !is_local_access_eligible_account(&raw_account, collection.restrict_free_accounts) {
+                let reason = build_disabled_reason_for_local_access_account(
+                    &raw_account,
+                    collection.restrict_free_accounts,
+                )
+                .unwrap_or_else(|| "账号不支持加入本地接入".to_string());
+                log_codex_api_failure(
+                    None,
+                    Some(request),
+                    None,
+                    Some(raw_account.id.as_str()),
+                    Some(raw_account.email.as_str()),
+                    None,
+                    reason.as_str(),
+                );
+                last_error = reason;
                 continue;
             }
-            if collection.restrict_free_accounts && is_free_plan_type(account.plan_type.as_deref())
+
+            if !is_openai_compatible && !codex_model_supported {
+                last_status = StatusCode::BAD_REQUEST.as_u16();
+                last_error = format!(
+                    "模型 {} 不在 Codex 本地接入支持列表中，已跳过 Codex OAuth 账号",
+                    routing_hint.model_key
+                );
+                continue;
+            }
+
+            let mut account = if is_openai_compatible {
+                raw_account
+            } else {
+                match get_prepared_account(service_id, &account_id).await {
+                    Ok(account) => account,
+                    Err(err) => {
+                        invalidate_prepared_account(service_id, &account_id).await;
+                        log_codex_api_failure(
+                            None,
+                            Some(request),
+                            None,
+                            Some(account_id.as_str()),
+                            None,
+                            None,
+                            format!("账号预处理失败: {}", err).as_str(),
+                        );
+                        last_error = err;
+                        continue;
+                    }
+                }
+            };
+
+            if !is_openai_compatible
+                && collection.restrict_free_accounts
+                && is_free_plan_type(account.plan_type.as_deref())
             {
                 log_codex_api_failure(
                     None,
@@ -5259,26 +7711,74 @@ async fn proxy_request_with_account_pool(
                 continue;
             }
 
+            let (prepared_request, response_adapter) = if is_openai_compatible {
+                match prepare_openai_compatible_gateway_request(request.clone()) {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        last_status = StatusCode::BAD_REQUEST.as_u16();
+                        last_error = err;
+                        last_account_id = Some(account.id.clone());
+                        last_account_email = Some(account.email.clone());
+                        last_source_metadata = Some(source_metadata.clone());
+                        continue;
+                    }
+                }
+            } else {
+                match prepare_gateway_request(request.clone()) {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        last_status = StatusCode::BAD_REQUEST.as_u16();
+                        last_error = err;
+                        last_account_id = Some(account.id.clone());
+                        last_account_email = Some(account.email.clone());
+                        last_source_metadata = Some(source_metadata.clone());
+                        continue;
+                    }
+                }
+            };
+
+            attempted_in_round = true;
+            attempts += 1;
             last_account_id = Some(account.id.clone());
             last_account_email = Some(account.email.clone());
+            last_source_metadata = Some(source_metadata.clone());
 
             let mut single_account_status_retry_attempt = 0usize;
             loop {
-                let first_response = send_upstream_request(
-                    &request.method,
-                    &upstream_target,
-                    &request.headers,
-                    &request.body,
-                    &account,
-                )
-                .await;
+                let first_response = if is_openai_compatible {
+                    send_openai_compatible_upstream_request(
+                        &prepared_request.method,
+                        &prepared_request.target,
+                        &prepared_request.headers,
+                        &prepared_request.body,
+                        &account,
+                    )
+                    .await
+                } else {
+                    let upstream_target = resolve_upstream_target(&prepared_request.target)
+                        .map_err(|err| ProxyDispatchError {
+                            status: 400,
+                            message: err,
+                            account_id: Some(account.id.clone()),
+                            account_email: Some(account.email.clone()),
+                            source_metadata: Some(source_metadata.clone()),
+                        })?;
+                    send_upstream_request(
+                        &prepared_request.method,
+                        &upstream_target,
+                        &prepared_request.headers,
+                        &prepared_request.body,
+                        &account,
+                    )
+                    .await
+                };
 
                 let mut response = match first_response {
                     Ok(response) => response,
                     Err(err) => {
                         log_codex_api_failure(
                             None,
-                            Some(request),
+                            Some(&prepared_request),
                             None,
                             Some(account.id.as_str()),
                             Some(account.email.as_str()),
@@ -5290,15 +7790,23 @@ async fn proxy_request_with_account_pool(
                     }
                 };
 
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    match force_refresh_gateway_account(&account_id).await {
+                if !is_openai_compatible && response.status() == StatusCode::UNAUTHORIZED {
+                    match force_refresh_gateway_account(service_id, &account_id).await {
                         Ok(refreshed_account) => {
                             account = refreshed_account;
+                            let upstream_target = resolve_upstream_target(&prepared_request.target)
+                                .map_err(|err| ProxyDispatchError {
+                                    status: 400,
+                                    message: err,
+                                    account_id: Some(account.id.clone()),
+                                    account_email: Some(account.email.clone()),
+                                    source_metadata: Some(source_metadata.clone()),
+                                })?;
                             response = match send_upstream_request(
-                                &request.method,
+                                &prepared_request.method,
                                 &upstream_target,
-                                &request.headers,
-                                &request.body,
+                                &prepared_request.headers,
+                                &prepared_request.body,
                                 &account,
                             )
                             .await
@@ -5307,7 +7815,7 @@ async fn proxy_request_with_account_pool(
                                 Err(err) => {
                                     log_codex_api_failure(
                                         None,
-                                        Some(request),
+                                        Some(&prepared_request),
                                         None,
                                         Some(account.id.as_str()),
                                         Some(account.email.as_str()),
@@ -5321,10 +7829,10 @@ async fn proxy_request_with_account_pool(
 
                             if response.status() == StatusCode::UNAUTHORIZED {
                                 last_status = StatusCode::UNAUTHORIZED.as_u16();
-                                invalidate_prepared_account(&account_id).await;
+                                invalidate_prepared_account(service_id, &account_id).await;
                                 log_codex_api_failure(
                                     None,
-                                    Some(request),
+                                    Some(&prepared_request),
                                     Some(last_status),
                                     Some(account.id.as_str()),
                                     Some(account.email.as_str()),
@@ -5336,10 +7844,10 @@ async fn proxy_request_with_account_pool(
                             }
                         }
                         Err(err) => {
-                            invalidate_prepared_account(&account_id).await;
+                            invalidate_prepared_account(service_id, &account_id).await;
                             log_codex_api_failure(
                                 None,
-                                Some(request),
+                                Some(&prepared_request),
                                 Some(StatusCode::UNAUTHORIZED.as_u16()),
                                 Some(account.id.as_str()),
                                 Some(account.email.as_str()),
@@ -5353,11 +7861,13 @@ async fn proxy_request_with_account_pool(
                 }
 
                 if response.status().is_success() {
-                    clear_model_cooldown(&account.id, &routing_hint.model_key).await;
+                    clear_model_cooldown(service_id, &account.id, &routing_hint.model_key).await;
                     return Ok(ProxyDispatchSuccess {
                         upstream: response,
                         account_id: account.id.clone(),
                         account_email: account.email.clone(),
+                        response_adapter,
+                        source_metadata,
                     });
                 }
 
@@ -5366,7 +7876,7 @@ async fn proxy_request_with_account_pool(
                 let message = summarize_upstream_error(status, &body);
                 log_codex_api_failure(
                     None,
-                    Some(request),
+                    Some(&prepared_request),
                     Some(status.as_u16()),
                     Some(account.id.as_str()),
                     Some(account.email.as_str()),
@@ -5375,7 +7885,13 @@ async fn proxy_request_with_account_pool(
                 );
 
                 if let Some(retry_after) = parse_codex_retry_after(status, &body) {
-                    set_model_cooldown(&account.id, &routing_hint.model_key, retry_after).await;
+                    set_model_cooldown(
+                        service_id,
+                        &account.id,
+                        &routing_hint.model_key,
+                        retry_after,
+                    )
+                    .await;
                     round_cooldown_wait = Some(match round_cooldown_wait {
                         Some(current) if current <= retry_after => current,
                         _ => retry_after,
@@ -5394,7 +7910,12 @@ async fn proxy_request_with_account_pool(
                     continue;
                 }
 
-                if should_try_next_account(status, &body) {
+                let should_try_next = if is_openai_compatible {
+                    should_try_next_openai_compatible_account(status, &body)
+                } else {
+                    should_try_next_account(status, &body)
+                };
+                if should_try_next {
                     last_status = status.as_u16();
                     last_error =
                         format!("账号 {} 当前不可用，已尝试轮转: {}", account.email, message);
@@ -5406,6 +7927,7 @@ async fn proxy_request_with_account_pool(
                     message,
                     account_id: Some(account.id.clone()),
                     account_email: Some(account.email.clone()),
+                    source_metadata: Some(source_metadata.clone()),
                 });
             }
         }
@@ -5424,6 +7946,7 @@ async fn proxy_request_with_account_pool(
                     message: build_cooldown_unavailable_message(&routing_hint.model_key, wait),
                     account_id: affinity_account_id.clone(),
                     account_email: None,
+                    source_metadata: None,
                 });
             }
             break;
@@ -5450,10 +7973,12 @@ async fn proxy_request_with_account_pool(
         },
         account_id: last_account_id,
         account_email: last_account_email,
+        source_metadata: last_source_metadata,
     })
 }
 
 async fn handle_connection(
+    service_id: String,
     mut stream: TcpStream,
     addr: std::net::SocketAddr,
 ) -> Result<(), String> {
@@ -5519,7 +8044,7 @@ async fn handle_connection(
 
     let state = {
         let runtime = gateway_runtime().lock().await;
-        build_state_snapshot(&runtime)
+        build_state_snapshot_for_service(&runtime, Some(service_id.as_str()))
     };
     let Some(collection) = state.collection else {
         write_json_error_response(
@@ -5553,21 +8078,66 @@ async fn handle_connection(
         return Ok(());
     }
 
-    if api_key != collection.api_key {
+    let Some(validated_api_key) = find_enabled_api_key(&collection, &api_key) else {
         write_json_error_response(
             &mut stream,
             Some(&addr),
             Some(&parsed),
             401,
             "Unauthorized",
-            "本地访问秘钥无效",
+            "本地访问秘钥无效或已停用",
             None,
             None,
             None,
         )
         .await?;
         return Ok(());
-    }
+    };
+
+    touch_local_access_api_key(&service_id, &validated_api_key.id).await;
+
+    let started_at = Instant::now();
+    let requested_model_id = extract_request_model_id(&parsed);
+    if is_api_key_over_monthly_limit(&state.stats, &validated_api_key) {
+        write_json_error_response(
+            &mut stream,
+            Some(&addr),
+            Some(&parsed),
+            429,
+            "Too Many Requests",
+            "API 服务密钥近 30 天 Token 配额已用完",
+            None,
+            None,
+            Some(started_at.elapsed().as_millis() as u64),
+        )
+        .await?;
+        if let Err(err) = record_request_stats(
+            &service_id,
+            Some(requested_model_id.as_str()),
+            None,
+            None,
+            None,
+            Some(validated_api_key.id.as_str()),
+            Some(validated_api_key.name.as_str()),
+            false,
+            started_at.elapsed().as_millis() as u64,
+            None,
+            Some(429),
+            Some("API 服务密钥近 30 天 Token 配额已用完"),
+            Some("api_key_quota"),
+            false,
+        )
+        .await
+        {
+            logger::log_codex_api_warn(&format!(
+                "[CodexLocalAccess] 写入配额拦截统计失败: {}",
+                err
+            ));
+        }
+        return Ok(());
+    };
+
+    let effective_account_ids = effective_account_ids_for_api_key(&collection, &validated_api_key);
 
     if is_local_models_request(&parsed.target) {
         if collection.account_ids.is_empty() {
@@ -5585,8 +8155,25 @@ async fn handle_connection(
             .await?;
             return Ok(());
         }
+        if effective_account_ids.is_empty() {
+            write_json_error_response(
+                &mut stream,
+                Some(&addr),
+                Some(&parsed),
+                403,
+                "Forbidden",
+                "API 服务密钥没有可用上游账号",
+                None,
+                None,
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
 
-        let response = json_response(200, "OK", &build_local_models_response());
+        let models =
+            build_local_models_response_for_collection(&collection, &effective_account_ids).await;
+        let response = json_response(200, "OK", &models);
         stream
             .write_all(&response)
             .await
@@ -5594,40 +8181,33 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let started_at = Instant::now();
-    let (prepared_request, response_adapter) = match prepare_gateway_request(parsed) {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            write_json_error_response(
-                &mut stream,
-                Some(&addr),
-                None,
-                400,
-                "Bad Request",
-                err.as_str(),
-                None,
-                None,
-                Some(started_at.elapsed().as_millis() as u64),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    match proxy_request_with_account_pool(&prepared_request, &collection).await {
+    match proxy_request_with_account_pool(&service_id, &parsed, &collection, &effective_account_ids)
+        .await
+    {
         Ok(success) => {
+            let stats_model_id = requested_model_id.as_str();
             let response_capture =
-                write_gateway_response(&mut stream, success.upstream, response_adapter).await?;
+                write_gateway_response(&mut stream, success.upstream, success.response_adapter)
+                    .await?;
             if let Some(response_id) = response_capture.response_id.as_deref() {
-                bind_response_affinity(response_id, &success.account_id).await;
+                bind_response_affinity(&service_id, response_id, &success.account_id).await;
             }
             let latency_ms = started_at.elapsed().as_millis() as u64;
             if let Err(err) = record_request_stats(
+                &service_id,
+                Some(stats_model_id),
                 Some(success.account_id.as_str()),
                 Some(success.account_email.as_str()),
+                Some(&success.source_metadata),
+                Some(validated_api_key.id.as_str()),
+                Some(validated_api_key.name.as_str()),
                 true,
                 latency_ms,
                 response_capture.usage,
+                None,
+                None,
+                None,
+                false,
             )
             .await
             {
@@ -5644,11 +8224,12 @@ async fn handle_connection(
                 message,
                 account_id,
                 account_email,
+                source_metadata,
             } = error;
             let latency_ms = started_at.elapsed().as_millis() as u64;
             log_codex_api_failure(
                 Some(&addr),
-                Some(&prepared_request),
+                Some(&parsed),
                 Some(status),
                 account_id.as_deref(),
                 account_email.as_deref(),
@@ -5658,6 +8239,7 @@ async fn handle_connection(
             let status_text = match status {
                 400 => "Bad Request",
                 401 => "Unauthorized",
+                403 => "Forbidden",
                 404 => "Not Found",
                 405 => "Method Not Allowed",
                 429 => "Too Many Requests",
@@ -5670,11 +8252,20 @@ async fn handle_connection(
                 .await
                 .map_err(|e| format!("写入错误响应失败: {}", e));
             if let Err(err) = record_request_stats(
+                &service_id,
+                Some(requested_model_id.as_str()),
                 account_id.as_deref(),
                 account_email.as_deref(),
+                source_metadata.as_ref(),
+                Some(validated_api_key.id.as_str()),
+                Some(validated_api_key.name.as_str()),
                 false,
                 latency_ms,
                 None,
+                Some(status),
+                Some(message.as_str()),
+                Some("upstream_request"),
+                matches!(status, 429 | 500..=599),
             )
             .await
             {
@@ -5691,18 +8282,173 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_payload, build_chat_completion_stream_body, build_images_api_payload,
-        build_local_models_response, build_ordered_account_ids, build_request_routing_hint,
-        extract_usage_capture, is_responses_completion_event, parse_codex_retry_after,
+        append_diagnostic_event, append_usage_event, build_chat_completion_payload,
+        build_chat_completion_stream_body, build_images_api_payload,
+        build_local_access_diagnostics, build_local_models_response,
+        build_openai_compatible_upstream_headers, build_openai_compatible_upstream_url,
+        build_ordered_account_ids, build_request_routing_hint, build_state_snapshot_for_service,
+        effective_account_ids_for_api_key, empty_stats_snapshot, extract_usage_capture,
+        find_enabled_api_key, is_api_key_over_monthly_limit, is_local_access_eligible_account,
+        new_local_access_collection, normalize_account_ids_for_collection, parse_codex_retry_after,
         parse_responses_payload_from_upstream, prepare_gateway_request,
-        resolve_supported_model_alias, should_retry_single_account_upstream_status,
-        should_treat_response_as_stream, should_try_next_account, GatewayResponseAdapter,
-        ParsedRequest, ResponseUsageCollector,
+        prepare_openai_compatible_gateway_request, proxy_request_with_account_pool,
+        recompute_time_windows, resolve_default_api_key, resolve_local_api_key_allowed_account_ids,
+        resolve_supported_model_alias, sanitize_collection_api_keys, sanitize_config,
+        sanitize_diagnostic_message, service_runtime_from_collection,
+        should_retry_single_account_upstream_status, should_treat_response_as_stream,
+        should_try_next_account, trim_diagnostic_events, upsert_upstream_health_sample,
+        GatewayResponseAdapter, GatewayRuntime, GatewayServiceRuntime, LocalAccessSourceMetadata,
+        ParsedRequest, ResponseUsageCollector, UsageCapture, DEFAULT_LOCAL_ACCESS_SERVICE_ID,
+        DEFAULT_LOCAL_ACCESS_SERVICE_NAME,
+    };
+    use crate::models::codex::{CodexAccount, CodexApiProviderMode, CodexTokens};
+    use crate::models::codex_local_access::{
+        CodexLocalAccessApiKey, CodexLocalAccessCollection, CodexLocalAccessConfig,
+        CodexLocalAccessDiagnosticEvent, CodexLocalAccessRoutingStrategy, CodexLocalAccessStats,
+        CodexLocalAccessUpstreamHealth, CodexLocalAccessUpstreamSource,
     };
     use reqwest::StatusCode;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use tokio::time::Duration;
+
+    fn test_api_key(id: &str, name: &str, key: &str, enabled: bool) -> CodexLocalAccessApiKey {
+        CodexLocalAccessApiKey {
+            id: id.to_string(),
+            name: name.to_string(),
+            key: key.to_string(),
+            enabled,
+            monthly_token_limit: None,
+            allowed_account_ids: None,
+            created_at: 1,
+            updated_at: 1,
+            last_used_at: None,
+        }
+    }
+
+    fn test_collection(api_keys: Vec<CodexLocalAccessApiKey>) -> CodexLocalAccessCollection {
+        CodexLocalAccessCollection {
+            id: DEFAULT_LOCAL_ACCESS_SERVICE_ID.to_string(),
+            name: DEFAULT_LOCAL_ACCESS_SERVICE_NAME.to_string(),
+            enabled: true,
+            port: 34567,
+            api_keys,
+            default_api_key_id: None,
+            legacy_api_key: None,
+            routing_strategy: CodexLocalAccessRoutingStrategy::Auto,
+            restrict_free_accounts: true,
+            account_ids: vec!["acc-1".to_string()],
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn test_api_key_account(base_url: Option<&str>) -> CodexAccount {
+        CodexAccount::new_api_key(
+            "codex_apikey_test".to_string(),
+            "api-key-test".to_string(),
+            "sk-test".to_string(),
+            if base_url.is_some() {
+                CodexApiProviderMode::Custom
+            } else {
+                CodexApiProviderMode::OpenaiBuiltin
+            },
+            base_url.map(str::to_string),
+            Some("relay".to_string()),
+            Some("Relay".to_string()),
+        )
+    }
+
+    fn test_oauth_account(plan_type: Option<&str>) -> CodexAccount {
+        let mut account = CodexAccount::new(
+            "acc-oauth".to_string(),
+            "alice@example.com".to_string(),
+            CodexTokens {
+                id_token: String::new(),
+                access_token: "access-token".to_string(),
+                refresh_token: None,
+            },
+        );
+        account.plan_type = plan_type.map(str::to_string);
+        account
+    }
+
+    #[test]
+    fn new_local_access_service_starts_blank_with_default_key() {
+        let collection = new_local_access_collection("svc-a".to_string(), "Team A")
+            .expect("service collection should be created");
+
+        assert_eq!(collection.id, "svc-a");
+        assert_eq!(collection.name, "Team A");
+        assert!(!collection.enabled);
+        assert!(collection.account_ids.is_empty());
+        assert_eq!(collection.api_keys.len(), 1);
+        assert_eq!(
+            collection.default_api_key_id.as_deref(),
+            Some(collection.api_keys[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn sanitize_config_fills_legacy_service_identity_and_selection() {
+        let mut legacy = test_collection(vec![test_api_key("key-a", "Alice", "agt_codex_a", true)]);
+        legacy.id.clear();
+        legacy.name.clear();
+        let mut config = CodexLocalAccessConfig {
+            services: vec![legacy],
+            selected_service_id: None,
+        };
+
+        assert!(sanitize_config(&mut config).expect("config should sanitize"));
+        assert_eq!(config.services.len(), 1);
+        assert_eq!(config.services[0].id, DEFAULT_LOCAL_ACCESS_SERVICE_ID);
+        assert_eq!(config.services[0].name, DEFAULT_LOCAL_ACCESS_SERVICE_NAME);
+        assert_eq!(
+            config.selected_service_id.as_deref(),
+            Some(DEFAULT_LOCAL_ACCESS_SERVICE_ID)
+        );
+    }
+
+    #[test]
+    fn state_snapshot_can_target_non_selected_service() {
+        let mut service_a =
+            test_collection(vec![test_api_key("key-a", "Alice", "agt_codex_a", true)]);
+        service_a.id = "svc-a".to_string();
+        service_a.name = "Service A".to_string();
+        service_a.port = 31001;
+        service_a.account_ids = vec!["acc-a".to_string()];
+
+        let mut service_b =
+            test_collection(vec![test_api_key("key-b", "Bob", "agt_codex_b", true)]);
+        service_b.id = "svc-b".to_string();
+        service_b.name = "Service B".to_string();
+        service_b.port = 31002;
+        service_b.account_ids = vec!["acc-b".to_string(), "acc-c".to_string()];
+
+        let mut runtime = GatewayRuntime {
+            loaded: true,
+            selected_service_id: Some("svc-a".to_string()),
+            ..GatewayRuntime::default()
+        };
+        runtime.services.insert(
+            "svc-a".to_string(),
+            service_runtime_from_collection(service_a, empty_stats_snapshot()),
+        );
+        runtime.services.insert(
+            "svc-b".to_string(),
+            service_runtime_from_collection(service_b, empty_stats_snapshot()),
+        );
+
+        let state = build_state_snapshot_for_service(&runtime, Some("svc-b"));
+
+        assert_eq!(state.selected_service_id.as_deref(), Some("svc-b"));
+        assert_eq!(
+            state.collection.as_ref().map(|item| item.name.as_str()),
+            Some("Service B")
+        );
+        assert_eq!(state.member_count, 2);
+        assert_eq!(state.services.len(), 2);
+    }
 
     #[test]
     fn extracts_usage_from_codex_response_completed_payload() {
@@ -5732,36 +8478,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_usage_from_codex_response_done_payload() {
-        assert!(is_responses_completion_event("response.done"));
-
-        let payload = json!({
-            "type": "response.done",
-            "response": {
-                "id": "resp_123",
-                "usage": {
-                    "input_tokens": 32,
-                    "input_tokens_details": {
-                        "cached_tokens": 9
-                    },
-                    "output_tokens": 6,
-                    "output_tokens_details": {
-                        "reasoning_tokens": 3
-                    },
-                    "total_tokens": 41
-                }
-            }
-        });
-
-        let usage = extract_usage_capture(&payload).expect("usage should be parsed");
-        assert_eq!(usage.input_tokens, 32);
-        assert_eq!(usage.output_tokens, 6);
-        assert_eq!(usage.cached_tokens, 9);
-        assert_eq!(usage.reasoning_tokens, 3);
-        assert_eq!(usage.total_tokens, 41);
-    }
-
-    #[test]
     fn extracts_usage_from_openai_prompt_and_completion_details() {
         let payload = json!({
             "usage": {
@@ -5781,7 +8497,25 @@ mod tests {
         assert_eq!(usage.output_tokens, 4);
         assert_eq!(usage.cached_tokens, 1);
         assert_eq!(usage.reasoning_tokens, 2);
-        assert_eq!(usage.total_tokens, 14);
+        assert_eq!(usage.total_tokens, 12);
+    }
+
+    #[test]
+    fn usage_fallback_counts_reasoning_when_output_tokens_are_missing() {
+        let payload = json!({
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 2
+                }
+            }
+        });
+
+        let usage = extract_usage_capture(&payload).expect("usage should be parsed");
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 2);
+        assert_eq!(usage.total_tokens, 10);
     }
 
     #[test]
@@ -5816,6 +8550,972 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
         .expect("retry after should be parsed");
 
         assert_eq!(wait, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn migrates_legacy_single_api_key_to_default_key() {
+        let mut collection: CodexLocalAccessCollection = serde_json::from_value(json!({
+            "enabled": true,
+            "port": 34567,
+            "apiKey": "agt_codex_legacy",
+            "routingStrategy": "auto",
+            "restrictFreeAccounts": true,
+            "accountIds": [],
+            "createdAt": 1,
+            "updatedAt": 1
+        }))
+        .expect("legacy collection should parse");
+
+        assert!(collection.api_keys.is_empty());
+        assert_eq!(
+            collection.legacy_api_key.as_deref(),
+            Some("agt_codex_legacy")
+        );
+        assert!(sanitize_collection_api_keys(&mut collection));
+        assert_eq!(collection.api_keys.len(), 1);
+        assert_eq!(collection.api_keys[0].name, "Default");
+        assert_eq!(collection.api_keys[0].key, "agt_codex_legacy");
+        assert!(collection.api_keys[0].enabled);
+        assert!(collection.api_keys[0].monthly_token_limit.is_none());
+        assert!(collection.api_keys[0].allowed_account_ids.is_none());
+        assert_eq!(
+            collection.default_api_key_id.as_deref(),
+            Some(collection.api_keys[0].id.as_str())
+        );
+        assert!(collection.legacy_api_key.is_none());
+
+        let serialized = serde_json::to_value(&collection).expect("collection should serialize");
+        assert!(serialized.get("apiKey").is_none());
+        assert!(serialized.get("apiKeys").is_some());
+        assert!(serialized.get("defaultApiKeyId").is_some());
+    }
+
+    #[test]
+    fn legacy_api_key_missing_allowed_accounts_defaults_to_all_upstreams() {
+        let mut collection: CodexLocalAccessCollection = serde_json::from_value(json!({
+            "enabled": true,
+            "port": 34567,
+            "apiKeys": [{
+                "id": "key-a",
+                "name": "Alice",
+                "key": "agt_codex_a",
+                "enabled": true,
+                "monthlyTokenLimit": null,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "lastUsedAt": null
+            }],
+            "routingStrategy": "auto",
+            "restrictFreeAccounts": true,
+            "accountIds": ["acc-1", "acc-2"],
+            "createdAt": 1,
+            "updatedAt": 1
+        }))
+        .expect("collection should parse");
+
+        assert!(collection.api_keys[0].allowed_account_ids.is_none());
+        assert!(collection.default_api_key_id.is_none());
+        assert!(sanitize_collection_api_keys(&mut collection));
+        assert_eq!(collection.default_api_key_id.as_deref(), Some("key-a"));
+        assert_eq!(
+            effective_account_ids_for_api_key(&collection, &collection.api_keys[0]),
+            vec!["acc-1".to_string(), "acc-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_default_collection_marks_initial_key_as_default() {
+        let collection = super::new_default_collection().expect("collection should be created");
+        assert_eq!(collection.api_keys.len(), 1);
+        assert_eq!(
+            collection.default_api_key_id.as_deref(),
+            Some(collection.api_keys[0].id.as_str())
+        );
+        assert_eq!(
+            resolve_default_api_key(&collection).map(|api_key| api_key.id.as_str()),
+            Some(collection.api_keys[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn resolve_default_api_key_uses_selected_usable_key() {
+        let mut collection = test_collection(vec![
+            test_api_key("key-a", "Alice", "agt_codex_a", true),
+            test_api_key("key-b", "Bob", "agt_codex_b", true),
+        ]);
+        collection.default_api_key_id = Some(" key-b ".to_string());
+
+        assert!(sanitize_collection_api_keys(&mut collection));
+        assert_eq!(collection.default_api_key_id.as_deref(), Some("key-b"));
+        assert_eq!(
+            resolve_default_api_key(&collection).map(|api_key| api_key.id.as_str()),
+            Some("key-b")
+        );
+    }
+
+    #[test]
+    fn sanitize_default_api_key_falls_back_when_selected_key_is_unusable_or_deleted() {
+        let mut collection = test_collection(vec![
+            test_api_key("key-a", "Alice", "agt_codex_a", true),
+            test_api_key("key-b", "Bob", "agt_codex_b", false),
+        ]);
+        collection.default_api_key_id = Some("key-b".to_string());
+
+        assert!(sanitize_collection_api_keys(&mut collection));
+        assert_eq!(collection.default_api_key_id.as_deref(), Some("key-a"));
+
+        collection.default_api_key_id = Some("key-a".to_string());
+        collection.api_keys.retain(|api_key| api_key.id != "key-a");
+        assert!(sanitize_collection_api_keys(&mut collection));
+        assert!(collection.default_api_key_id.is_none());
+        assert!(resolve_default_api_key(&collection).is_none());
+    }
+
+    #[test]
+    fn sanitize_default_api_key_keeps_null_when_no_usable_keys_exist() {
+        let mut collection = test_collection(vec![
+            test_api_key("key-a", "Alice", "agt_codex_a", false),
+            test_api_key("key-b", "Bob", "agt_codex_b", false),
+        ]);
+        collection.default_api_key_id = Some("key-a".to_string());
+
+        assert!(sanitize_collection_api_keys(&mut collection));
+        assert!(collection.default_api_key_id.is_none());
+        assert!(resolve_default_api_key(&collection).is_none());
+    }
+
+    #[test]
+    fn selected_upstreams_intersect_collection_in_collection_order() {
+        let collection = CodexLocalAccessCollection {
+            account_ids: vec![
+                "acc-1".to_string(),
+                "acc-2".to_string(),
+                "acc-3".to_string(),
+            ],
+            ..test_collection(vec![test_api_key("key-a", "Alice", "agt_codex_a", true)])
+        };
+        let mut api_key = collection.api_keys[0].clone();
+        api_key.allowed_account_ids = Some(vec![
+            "acc-3".to_string(),
+            "missing".to_string(),
+            "acc-1".to_string(),
+            "acc-1".to_string(),
+        ]);
+
+        assert_eq!(
+            effective_account_ids_for_api_key(&collection, &api_key),
+            vec!["acc-1".to_string(), "acc-3".to_string()]
+        );
+        assert_eq!(
+            normalize_account_ids_for_collection(
+                vec![
+                    "acc-2".to_string(),
+                    "acc-1".to_string(),
+                    "acc-2".to_string()
+                ],
+                &collection.account_ids,
+            ),
+            vec!["acc-1".to_string(), "acc-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolves_api_key_upstream_scope_for_all_selected_and_legacy_update() {
+        let collection_ids = vec!["acc-1".to_string(), "acc-2".to_string()];
+        assert_eq!(
+            resolve_local_api_key_allowed_account_ids(
+                Some("all"),
+                Some(vec!["acc-1".to_string()]),
+                &collection_ids,
+                Some(Some(vec!["acc-2".to_string()])),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_local_api_key_allowed_account_ids(
+                Some("selected"),
+                Some(vec!["acc-2".to_string(), "missing".to_string()]),
+                &collection_ids,
+                None,
+            )
+            .unwrap(),
+            Some(vec!["acc-2".to_string()])
+        );
+        assert_eq!(
+            resolve_local_api_key_allowed_account_ids(
+                None,
+                None,
+                &collection_ids,
+                Some(Some(vec!["acc-1".to_string()])),
+            )
+            .unwrap(),
+            Some(vec!["acc-1".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_empty_collection_and_empty_key_scope_use_distinct_statuses() {
+        let request = ParsedRequest {
+            method: "POST".to_string(),
+            target: "/v1/chat/completions".to_string(),
+            headers: HashMap::new(),
+            body: br#"{"model":"gpt-5"}"#.to_vec(),
+        };
+        let mut collection =
+            test_collection(vec![test_api_key("key-a", "Alice", "agt_codex_a", true)]);
+        collection.account_ids.clear();
+        let error = proxy_request_with_account_pool("test-service", &request, &collection, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 503);
+
+        collection.account_ids = vec!["acc-1".to_string()];
+        let error = proxy_request_with_account_pool("test-service", &request, &collection, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 403);
+    }
+
+    #[test]
+    fn api_key_accounts_are_local_access_eligible_with_credentials() {
+        let api_account = test_api_key_account(Some("https://relay.local/v1"));
+        assert!(is_local_access_eligible_account(&api_account, true));
+
+        let mut missing_key = api_account.clone();
+        missing_key.openai_api_key = Some("   ".to_string());
+        assert!(!is_local_access_eligible_account(&missing_key, true));
+
+        let free_oauth = test_oauth_account(Some("free"));
+        assert!(!is_local_access_eligible_account(&free_oauth, true));
+        assert!(is_local_access_eligible_account(&free_oauth, false));
+    }
+
+    #[test]
+    fn builds_openai_compatible_urls_for_v1_and_root_base_urls() {
+        let with_v1 = test_api_key_account(Some("https://relay.local/v1"));
+        let without_v1 = test_api_key_account(Some("https://relay.local"));
+        let builtin = test_api_key_account(None);
+
+        assert_eq!(
+            build_openai_compatible_upstream_url(&with_v1, "/v1/chat/completions").unwrap(),
+            "https://relay.local/v1/chat/completions"
+        );
+        assert_eq!(
+            build_openai_compatible_upstream_url(&without_v1, "/v1/chat/completions").unwrap(),
+            "https://relay.local/v1/chat/completions"
+        );
+        assert_eq!(
+            build_openai_compatible_upstream_url(&builtin, "/v1/models").unwrap(),
+            "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn openai_compatible_headers_strip_local_credentials() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "Bearer agt_codex_local".to_string(),
+        );
+        headers.insert("x-api-key".to_string(), "agt_codex_local".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("openai-beta".to_string(), "responses=v1".to_string());
+        headers.insert(
+            "chatgpt-account-id".to_string(),
+            "chatgpt-account".to_string(),
+        );
+
+        let sanitized = build_openai_compatible_upstream_headers(&headers, "sk-upstream").unwrap();
+
+        assert_eq!(
+            sanitized.get("authorization").map(String::as_str),
+            Some("Bearer sk-upstream")
+        );
+        assert!(sanitized.get("x-api-key").is_none());
+        assert!(sanitized.get("chatgpt-account-id").is_none());
+        assert_eq!(
+            sanitized.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            sanitized.get("openai-beta").map(String::as_str),
+            Some("responses=v1")
+        );
+    }
+
+    #[test]
+    fn openai_compatible_prepare_keeps_chat_completions_unmodified() {
+        let request = ParsedRequest {
+            method: "POST".to_string(),
+            target: "/v1/chat/completions".to_string(),
+            headers: HashMap::new(),
+            body:
+                br#"{"model":"third-party-model","messages":[{"role":"user","content":"hello"}]}"#
+                    .to_vec(),
+        };
+
+        let (prepared, adapter) =
+            prepare_openai_compatible_gateway_request(request).expect("request should pass");
+        assert_eq!(prepared.target, "/v1/chat/completions");
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("third-party-model")
+        );
+        match adapter {
+            GatewayResponseAdapter::Passthrough { request_is_stream } => {
+                assert!(!request_is_stream);
+            }
+            _ => panic!("expected passthrough adapter"),
+        }
+    }
+
+    #[test]
+    fn finds_only_enabled_local_api_keys() {
+        let collection = test_collection(vec![
+            test_api_key("key-a", "Alice", "agt_codex_a", true),
+            test_api_key("key-b", "Bob", "agt_codex_b", false),
+        ]);
+
+        let matched =
+            find_enabled_api_key(&collection, "agt_codex_a").expect("enabled key should match");
+        assert_eq!(matched.id, "key-a");
+        assert!(find_enabled_api_key(&collection, "agt_codex_b").is_none());
+        assert!(find_enabled_api_key(&collection, "agt_codex_missing").is_none());
+    }
+
+    #[test]
+    fn enforces_monthly_token_limit_from_api_key_stats() {
+        let mut api_key = test_api_key("key-a", "Alice", "agt_codex_a", true);
+        api_key.monthly_token_limit = Some(10);
+        let mut stats = empty_stats_snapshot();
+        let now = stats.updated_at.saturating_add(1);
+        let usage = UsageCapture {
+            input_tokens: 6,
+            output_tokens: 4,
+            total_tokens: 10,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        append_usage_event(
+            &mut stats.events,
+            now,
+            Some("gpt-5.4-mini"),
+            Some("acc-1"),
+            Some("alice@example.com"),
+            None,
+            Some(api_key.id.as_str()),
+            Some(api_key.name.as_str()),
+            true,
+            20,
+            Some(&usage),
+        );
+        recompute_time_windows(&mut stats, now);
+
+        assert!(is_api_key_over_monthly_limit(&stats, &api_key));
+        api_key.monthly_token_limit = Some(11);
+        assert!(!is_api_key_over_monthly_limit(&stats, &api_key));
+        api_key.monthly_token_limit = None;
+        assert!(!is_api_key_over_monthly_limit(&stats, &api_key));
+    }
+
+    #[test]
+    fn usage_windows_include_account_and_api_key_stats() {
+        let mut stats = empty_stats_snapshot();
+        let now = stats.updated_at.saturating_add(1);
+        let usage = UsageCapture {
+            input_tokens: 7,
+            output_tokens: 3,
+            total_tokens: 10,
+            cached_tokens: 2,
+            reasoning_tokens: 1,
+        };
+        append_usage_event(
+            &mut stats.events,
+            now,
+            Some("gpt-5.4-mini"),
+            Some("acc-1"),
+            Some("alice@example.com"),
+            Some(&LocalAccessSourceMetadata {
+                source_type: "codex_oauth".to_string(),
+                provider_name: Some("Codex".to_string()),
+                base_url_host: Some("chatgpt.com".to_string()),
+            }),
+            Some("key-a"),
+            Some("Alice"),
+            true,
+            42,
+            Some(&usage),
+        );
+        recompute_time_windows(&mut stats, now);
+
+        assert_eq!(stats.monthly.totals.request_count, 1);
+        assert_eq!(stats.monthly.totals.total_tokens, 10);
+        assert_eq!(stats.monthly.accounts.len(), 1);
+        assert_eq!(stats.monthly.accounts[0].account_id, "acc-1");
+        assert_eq!(
+            stats.monthly.accounts[0].source_type.as_deref(),
+            Some("codex_oauth")
+        );
+        assert_eq!(stats.monthly.accounts[0].usage.input_tokens, 7);
+        assert_eq!(stats.monthly.api_keys.len(), 1);
+        assert_eq!(stats.monthly.api_keys[0].api_key_id, "key-a");
+        assert_eq!(stats.monthly.api_keys[0].api_key_name, "Alice");
+        assert_eq!(stats.monthly.api_keys[0].usage.output_tokens, 3);
+        assert_eq!(stats.monthly.models.len(), 1);
+        assert_eq!(stats.monthly.models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(stats.monthly.models[0].usage.request_count, 1);
+        assert_eq!(stats.monthly.models[0].usage.total_tokens, 10);
+        assert_eq!(stats.monthly.models[0].usage.cached_tokens, 2);
+        assert_eq!(stats.monthly.models[0].usage.reasoning_tokens, 1);
+        assert_eq!(stats.monthly.api_keys[0].models.len(), 1);
+        assert_eq!(stats.monthly.api_keys[0].models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(stats.monthly.api_keys[0].models[0].usage.output_tokens, 3);
+        assert_eq!(stats.events[0].model_id, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn usage_windows_group_models_per_total_and_api_key() {
+        let mut stats = empty_stats_snapshot();
+        let now = stats.updated_at.saturating_add(1);
+        let usage_a = UsageCapture {
+            input_tokens: 20,
+            output_tokens: 5,
+            total_tokens: 25,
+            cached_tokens: 4,
+            reasoning_tokens: 1,
+        };
+        let usage_b = UsageCapture {
+            input_tokens: 3,
+            output_tokens: 7,
+            total_tokens: 10,
+            cached_tokens: 0,
+            reasoning_tokens: 2,
+        };
+
+        append_usage_event(
+            &mut stats.events,
+            now,
+            Some("gpt-5.4-mini"),
+            Some("acc-a"),
+            Some("a@example.com"),
+            None,
+            Some("key-a"),
+            Some("Alice"),
+            true,
+            10,
+            Some(&usage_a),
+        );
+        append_usage_event(
+            &mut stats.events,
+            now + 1,
+            Some("gpt-5.4-mini"),
+            Some("acc-b"),
+            Some("b@example.com"),
+            None,
+            Some("key-b"),
+            Some("Bob"),
+            true,
+            11,
+            Some(&usage_b),
+        );
+        append_usage_event(
+            &mut stats.events,
+            now + 2,
+            Some("gpt-5.2"),
+            Some("acc-a"),
+            Some("a@example.com"),
+            None,
+            Some("key-a"),
+            Some("Alice"),
+            false,
+            12,
+            Some(&usage_b),
+        );
+
+        recompute_time_windows(&mut stats, now + 2);
+
+        assert_eq!(stats.monthly.models.len(), 2);
+        let mini = stats
+            .monthly
+            .models
+            .iter()
+            .find(|item| item.model_id == "gpt-5.4-mini")
+            .expect("expected gpt-5.4-mini model stats");
+        assert_eq!(mini.usage.request_count, 2);
+        assert_eq!(mini.usage.success_count, 2);
+        assert_eq!(mini.usage.total_tokens, 35);
+        assert_eq!(mini.usage.cached_tokens, 4);
+        assert_eq!(mini.usage.reasoning_tokens, 3);
+
+        let codex = stats
+            .monthly
+            .models
+            .iter()
+            .find(|item| item.model_id == "gpt-5.2")
+            .expect("expected gpt-5.2 model stats");
+        assert_eq!(codex.usage.request_count, 1);
+        assert_eq!(codex.usage.failure_count, 1);
+        assert_eq!(codex.usage.total_tokens, 10);
+
+        let key_a = stats
+            .monthly
+            .api_keys
+            .iter()
+            .find(|item| item.api_key_id == "key-a")
+            .expect("expected key-a stats");
+        assert_eq!(key_a.models.len(), 2);
+        assert_eq!(
+            key_a
+                .models
+                .iter()
+                .find(|item| item.model_id == "gpt-5.4-mini")
+                .expect("expected key-a mini model")
+                .usage
+                .total_tokens,
+            25
+        );
+        assert_eq!(
+            key_a
+                .models
+                .iter()
+                .find(|item| item.model_id == "gpt-5.2")
+                .expect("expected key-a gpt-5.2 model")
+                .usage
+                .failure_count,
+            1
+        );
+
+        let key_b = stats
+            .monthly
+            .api_keys
+            .iter()
+            .find(|item| item.api_key_id == "key-b")
+            .expect("expected key-b stats");
+        assert_eq!(key_b.models.len(), 1);
+        assert_eq!(key_b.models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(key_b.models[0].usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn usage_windows_group_blank_model_as_unknown() {
+        let mut stats = empty_stats_snapshot();
+        let now = stats.updated_at.saturating_add(1);
+        let usage = UsageCapture {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+        };
+
+        append_usage_event(
+            &mut stats.events,
+            now,
+            Some("   "),
+            Some("acc-a"),
+            Some("a@example.com"),
+            None,
+            Some("key-a"),
+            Some("Alice"),
+            true,
+            1,
+            Some(&usage),
+        );
+        recompute_time_windows(&mut stats, now);
+
+        assert_eq!(stats.monthly.models.len(), 1);
+        assert_eq!(stats.monthly.models[0].model_id, "unknown");
+        assert_eq!(stats.monthly.models[0].usage.total_tokens, 3);
+        assert_eq!(stats.monthly.api_keys[0].models[0].model_id, "unknown");
+    }
+
+    #[test]
+    fn old_stats_without_model_breakdowns_deserialize_and_recompute() {
+        let now = empty_stats_snapshot().updated_at.saturating_add(1);
+        let payload = json!({
+            "since": now - 1_000,
+            "updatedAt": now,
+            "totals": {
+                "requestCount": 1,
+                "successCount": 1,
+                "failureCount": 0,
+                "totalLatencyMs": 5,
+                "inputTokens": 4,
+                "outputTokens": 6,
+                "totalTokens": 10,
+                "cachedTokens": 1,
+                "reasoningTokens": 2
+            },
+            "accounts": [],
+            "apiKeys": [{
+                "apiKeyId": "key-a",
+                "apiKeyName": "Alice",
+                "usage": {
+                    "requestCount": 1,
+                    "successCount": 1,
+                    "failureCount": 0,
+                    "totalLatencyMs": 5,
+                    "inputTokens": 4,
+                    "outputTokens": 6,
+                    "totalTokens": 10,
+                    "cachedTokens": 1,
+                    "reasoningTokens": 2
+                },
+                "updatedAt": now
+            }],
+            "daily": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "weekly": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "monthly": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "events": [{
+                "timestamp": now,
+                "modelId": "gpt-5.4-mini",
+                "accountId": "acc-a",
+                "email": "a@example.com",
+                "apiKeyId": "key-a",
+                "apiKeyName": "Alice",
+                "success": true,
+                "latencyMs": 5,
+                "inputTokens": 4,
+                "outputTokens": 6,
+                "totalTokens": 10,
+                "cachedTokens": 1,
+                "reasoningTokens": 2
+            }]
+        });
+
+        let mut stats = serde_json::from_value::<
+            crate::models::codex_local_access::CodexLocalAccessStats,
+        >(payload)
+        .expect("old stats payload should deserialize");
+
+        assert!(stats.api_keys[0].models.is_empty());
+        assert!(stats.monthly.models.is_empty());
+
+        recompute_time_windows(&mut stats, now);
+
+        assert_eq!(stats.monthly.models.len(), 1);
+        assert_eq!(stats.monthly.models[0].model_id, "gpt-5.4-mini");
+        assert_eq!(stats.monthly.models[0].usage.total_tokens, 10);
+        assert_eq!(stats.monthly.api_keys[0].models.len(), 1);
+        assert_eq!(stats.monthly.api_keys[0].models[0].model_id, "gpt-5.4-mini");
+    }
+
+    #[test]
+    fn old_stats_without_diagnostics_deserialize_with_empty_defaults() {
+        let now = empty_stats_snapshot().updated_at;
+        let payload = json!({
+            "since": now - 1_000,
+            "updatedAt": now,
+            "totals": {},
+            "accounts": [],
+            "apiKeys": [],
+            "daily": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "weekly": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "monthly": {
+                "since": now - 1_000,
+                "updatedAt": now,
+                "totals": {},
+                "accounts": [],
+                "apiKeys": []
+            },
+            "events": []
+        });
+
+        let stats =
+            serde_json::from_value::<CodexLocalAccessStats>(payload).expect("stats should load");
+
+        assert!(stats.upstream_health.is_empty());
+        assert!(stats.diagnostic_events.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_events_trim_to_recent_thousand_records() {
+        let month_since = 10_000;
+        let mut events = vec![CodexLocalAccessDiagnosticEvent {
+            timestamp: month_since - 1,
+            message: "stale".to_string(),
+            ..CodexLocalAccessDiagnosticEvent::default()
+        }];
+        for index in 0..1005 {
+            events.push(CodexLocalAccessDiagnosticEvent {
+                timestamp: month_since + index,
+                message: format!("event-{index}"),
+                ..CodexLocalAccessDiagnosticEvent::default()
+            });
+        }
+
+        trim_diagnostic_events(&mut events, month_since);
+
+        assert_eq!(events.len(), 1000);
+        assert_eq!(
+            events.first().map(|event| event.timestamp),
+            Some(month_since + 5)
+        );
+        assert_eq!(
+            events.last().map(|event| event.timestamp),
+            Some(month_since + 1004)
+        );
+        assert!(events
+            .windows(2)
+            .all(|items| items[0].timestamp <= items[1].timestamp));
+    }
+
+    #[test]
+    fn diagnostic_message_sanitizer_redacts_headers_and_secrets() {
+        let sanitized = sanitize_diagnostic_message(
+            "failed Authorization: Bearer relay-token X-API-Key: custom-token sk-live agt_codex_secret",
+        );
+
+        assert!(sanitized.contains("[redacted]"));
+        assert!(!sanitized.to_ascii_lowercase().contains("authorization"));
+        assert!(!sanitized.to_ascii_lowercase().contains("x-api-key"));
+        assert!(!sanitized.to_ascii_lowercase().contains("bearer"));
+        assert!(!sanitized.contains("relay-token"));
+        assert!(!sanitized.contains("custom-token"));
+        assert!(!sanitized.contains("sk-live"));
+        assert!(!sanitized.contains("agt_codex_secret"));
+    }
+
+    #[test]
+    fn append_diagnostic_event_sanitizes_sensitive_message() {
+        let mut stats = empty_stats_snapshot();
+        append_diagnostic_event(
+            &mut stats,
+            20_000,
+            "error",
+            "upstream_request",
+            Some("key-a"),
+            Some("acc-a"),
+            Some("gpt-5.4-mini"),
+            Some(502),
+            Some("relay.example.com"),
+            "upstream returned X-API-Key: custom-token",
+            true,
+        );
+
+        assert_eq!(stats.diagnostic_events.len(), 1);
+        let event = &stats.diagnostic_events[0];
+        assert_eq!(event.api_key_id.as_deref(), Some("key-a"));
+        assert_eq!(event.account_id.as_deref(), Some("acc-a"));
+        assert_eq!(event.model_id.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(event.status_code, Some(502));
+        assert_eq!(event.base_url_host.as_deref(), Some("relay.example.com"));
+        assert!(event.retryable);
+        assert!(!event.message.contains("custom-token"));
+    }
+
+    #[test]
+    fn upstream_health_samples_track_success_failure_and_latency() {
+        let mut upstreams = Vec::new();
+        let metadata = LocalAccessSourceMetadata {
+            source_type: "openai_compatible".to_string(),
+            provider_name: Some("Relay".to_string()),
+            base_url_host: Some("relay.example.com".to_string()),
+        };
+
+        upsert_upstream_health_sample(
+            &mut upstreams,
+            Some("acc-a"),
+            Some("relay@example.com"),
+            Some(&metadata),
+            true,
+            100,
+            None,
+            10,
+        );
+        assert_eq!(upstreams.len(), 1);
+        assert!(upstreams[0].healthy);
+        assert_eq!(upstreams[0].last_success_at, Some(10));
+        assert_eq!(upstreams[0].consecutive_failures, 0);
+        assert_eq!(upstreams[0].average_latency_ms, 100);
+        assert_eq!(upstreams[0].source_type, "openai_compatible");
+        assert_eq!(
+            upstreams[0].base_url_host.as_deref(),
+            Some("relay.example.com")
+        );
+
+        upsert_upstream_health_sample(
+            &mut upstreams,
+            Some("acc-a"),
+            Some("relay@example.com"),
+            Some(&metadata),
+            false,
+            200,
+            Some("Bearer relay-token failed"),
+            20,
+        );
+        assert!(!upstreams[0].healthy);
+        assert_eq!(upstreams[0].last_failure_at, Some(20));
+        assert_eq!(upstreams[0].consecutive_failures, 1);
+        assert_eq!(upstreams[0].average_latency_ms, 125);
+        assert!(!upstreams[0]
+            .last_failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("relay-token"));
+
+        upsert_upstream_health_sample(
+            &mut upstreams,
+            Some("acc-a"),
+            Some("relay@example.com"),
+            Some(&metadata),
+            false,
+            0,
+            Some("sk-live"),
+            30,
+        );
+        assert_eq!(upstreams[0].consecutive_failures, 2);
+
+        upsert_upstream_health_sample(
+            &mut upstreams,
+            Some("acc-a"),
+            Some("relay@example.com"),
+            Some(&metadata),
+            true,
+            80,
+            None,
+            40,
+        );
+        assert!(upstreams[0].healthy);
+        assert_eq!(upstreams[0].last_success_at, Some(40));
+        assert_eq!(upstreams[0].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn diagnostics_warn_when_api_key_has_no_authorized_upstreams() {
+        let mut api_key = test_api_key("key-a", "Alice", "local-key", true);
+        api_key.allowed_account_ids = Some(Vec::new());
+        let mut collection = test_collection(vec![api_key]);
+        collection.account_ids = vec!["acc-a".to_string()];
+        let mut runtime = GatewayServiceRuntime {
+            collection: Some(collection.clone()),
+            running: true,
+            stats: empty_stats_snapshot(),
+            ..GatewayServiceRuntime::default()
+        };
+        let upstream_sources = vec![CodexLocalAccessUpstreamSource {
+            account_id: "acc-a".to_string(),
+            email: "alice@example.com".to_string(),
+            source_type: "codex_oauth".to_string(),
+            provider_name: Some("Codex".to_string()),
+            base_url_host: Some("chatgpt.com".to_string()),
+            selected: true,
+            eligible: true,
+            disabled_reason: None,
+        }];
+
+        let diagnostics = build_local_access_diagnostics(
+            &runtime,
+            runtime.collection.as_ref(),
+            &upstream_sources,
+            &runtime.stats,
+        );
+
+        assert_eq!(diagnostics.status, "degraded");
+        assert_eq!(diagnostics.api_keys.len(), 1);
+        assert_eq!(diagnostics.api_keys[0].authorized_account_count, 0);
+        assert_eq!(diagnostics.api_keys[0].warning_count, 1);
+        assert!(diagnostics.alerts.iter().any(|alert| {
+            alert.category == "api_key" && alert.message.contains("没有授权上游")
+        }));
+
+        runtime.running = false;
+        let diagnostics = build_local_access_diagnostics(
+            &runtime,
+            runtime.collection.as_ref(),
+            &upstream_sources,
+            &runtime.stats,
+        );
+        assert_eq!(diagnostics.status, "unavailable");
+    }
+
+    #[test]
+    fn diagnostics_warn_when_authorized_upstreams_are_unavailable() {
+        let mut api_key = test_api_key("key-a", "Alice", "local-key", true);
+        api_key.allowed_account_ids = Some(vec!["acc-a".to_string()]);
+        let mut collection = test_collection(vec![api_key]);
+        collection.account_ids = vec!["acc-a".to_string()];
+        let mut stats = empty_stats_snapshot();
+        stats.upstream_health.push(CodexLocalAccessUpstreamHealth {
+            account_id: "acc-a".to_string(),
+            email: "alice@example.com".to_string(),
+            source_type: "codex_oauth".to_string(),
+            provider_name: Some("Codex".to_string()),
+            base_url_host: Some("chatgpt.com".to_string()),
+            selected: true,
+            eligible: true,
+            healthy: false,
+            last_failure_at: Some(30),
+            consecutive_failures: 3,
+            last_failure_reason: Some("429 Too Many Requests".to_string()),
+            ..CodexLocalAccessUpstreamHealth::default()
+        });
+        let runtime = GatewayServiceRuntime {
+            collection: Some(collection.clone()),
+            running: true,
+            stats,
+            ..GatewayServiceRuntime::default()
+        };
+        let upstream_sources = vec![CodexLocalAccessUpstreamSource {
+            account_id: "acc-a".to_string(),
+            email: "alice@example.com".to_string(),
+            source_type: "codex_oauth".to_string(),
+            provider_name: Some("Codex".to_string()),
+            base_url_host: Some("chatgpt.com".to_string()),
+            selected: true,
+            eligible: true,
+            disabled_reason: None,
+        }];
+
+        let diagnostics = build_local_access_diagnostics(
+            &runtime,
+            runtime.collection.as_ref(),
+            &upstream_sources,
+            &runtime.stats,
+        );
+
+        assert_eq!(diagnostics.status, "unavailable");
+        assert_eq!(diagnostics.api_keys[0].authorized_account_count, 1);
+        assert_eq!(diagnostics.api_keys[0].available_account_count, 0);
+        assert_eq!(diagnostics.upstreams[0].consecutive_failures, 3);
+        assert!(diagnostics.alerts.iter().any(|alert| {
+            alert.category == "api_key" && alert.message.contains("均不可用")
+        }));
+        assert!(diagnostics.alerts.iter().any(|alert| {
+            alert.category == "upstream" && alert.message.contains("连续失败")
+        }));
     }
 
     #[test]
@@ -6182,26 +9882,6 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
     }
 
     #[test]
-    fn responses_stream_requests_stay_passthrough() {
-        let request = ParsedRequest {
-            method: "POST".to_string(),
-            target: "/v1/responses".to_string(),
-            headers: HashMap::from([("accept".to_string(), "text/event-stream".to_string())]),
-            body: br#"{"model":"gpt-5.4","stream":true,"input":"hello"}"#.to_vec(),
-        };
-
-        let (prepared, adapter) = prepare_gateway_request(request).expect("request should map");
-        assert_eq!(prepared.target, "/v1/responses");
-
-        match adapter {
-            GatewayResponseAdapter::Passthrough { request_is_stream } => {
-                assert!(request_is_stream);
-            }
-            _ => panic!("expected responses stream passthrough adapter"),
-        }
-    }
-
-    #[test]
     fn injects_image_generation_tool_for_responses_requests() {
         let request = ParsedRequest {
             method: "POST".to_string(),
@@ -6552,15 +10232,13 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
 
 data: {"type":"response.output_text.delta","delta":"stream-body"}
 
-event: response.done
-data: {"response":{"id":"resp_1","created_at":123,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":1},"output_tokens":1,"total_tokens":2}}}
+data: {"type":"response.completed","response":{"id":"resp_1","created_at":123,"model":"gpt-5.4","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}
 
 "#;
 
         let stream_body = build_chat_completion_stream_body(upstream_sse, br#"{}"#, "gpt-5.4");
         assert!(stream_body.contains("chat.completion.chunk"));
         assert!(stream_body.contains("stream-body"));
-        assert!(stream_body.contains("\"cached_tokens\":1"));
         assert!(stream_body.contains("data: [DONE]"));
     }
 
@@ -6593,35 +10271,6 @@ data: [DONE]
                 .and_then(|value| value.get("output_text"))
                 .and_then(Value::as_str),
             Some("hello world")
-        );
-    }
-
-    #[test]
-    fn parses_response_done_sse_payload_to_json() {
-        let sse = br#"event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"done body"}
-
-event: response.done
-data: {"response":{"id":"resp_done","model":"gpt-5.4","status":"completed","usage":{"input_tokens":3,"input_tokens_details":{"cached_tokens":2},"output_tokens":1,"total_tokens":4}}}
-
-"#;
-
-        let parsed = parse_responses_payload_from_upstream(sse).expect("sse should be parsed");
-        assert_eq!(
-            parsed
-                .get("response")
-                .and_then(|value| value.get("id"))
-                .and_then(Value::as_str),
-            Some("resp_done")
-        );
-        assert_eq!(
-            parsed
-                .get("response")
-                .and_then(|value| value.get("usage"))
-                .and_then(|value| value.get("input_tokens_details"))
-                .and_then(|value| value.get("cached_tokens"))
-                .and_then(Value::as_u64),
-            Some(2)
         );
     }
 }

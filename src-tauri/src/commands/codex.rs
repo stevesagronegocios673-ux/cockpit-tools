@@ -666,6 +666,7 @@ pub async fn codex_wakeup_run_enabled_tasks(
 
 const CODEX_GROUPS_FILE: &str = "codex_account_groups.json";
 const CODEX_MODEL_PROVIDERS_FILE: &str = "codex_model_providers.json";
+const OPENAI_PRICING_MARKDOWN_URL: &str = "https://developers.openai.com/api/docs/pricing.md";
 
 #[tauri::command]
 pub async fn load_codex_account_groups() -> Result<String, String> {
@@ -713,16 +714,81 @@ pub async fn save_codex_model_providers(data: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn codex_local_access_fetch_openai_pricing_markdown() -> Result<String, String> {
+    let response = reqwest::Client::new()
+        .get(OPENAI_PRICING_MARKDOWN_URL)
+        .header(reqwest::header::USER_AGENT, "Cockpit Tools pricing sync")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/markdown,text/plain,text/*,*/*",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch OpenAI pricing: {}", e))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("OpenAI pricing returned HTTP {}", status.as_u16()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read OpenAI pricing: {}", e))?;
+    if !text.contains("TextTokenPricingTables") {
+        return Err("OpenAI pricing response did not include token pricing tables".to_string());
+    }
+    Ok(text)
+}
+
+#[tauri::command]
 pub async fn codex_local_access_get_state() -> Result<CodexLocalAccessState, String> {
     codex_local_access::get_local_access_state().await
 }
 
 #[tauri::command]
+pub async fn codex_local_access_test_upstream(
+    service_id: Option<String>,
+    account_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::test_local_access_upstream(service_id, account_id).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_create_service(
+    name: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::create_local_access_service(name).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_rename_service(
+    service_id: String,
+    name: String,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::rename_local_access_service(service_id, name).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_delete_service(
+    service_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::delete_local_access_service(service_id).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_select_service(
+    service_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::select_local_access_service(service_id).await
+}
+
+#[tauri::command]
 pub async fn codex_local_access_save_accounts(
+    service_id: Option<String>,
     account_ids: Vec<String>,
     restrict_free_accounts: Option<bool>,
 ) -> Result<CodexLocalAccessState, String> {
     codex_local_access::save_local_access_accounts(
+        service_id,
         account_ids,
         restrict_free_accounts.unwrap_or(true),
     )
@@ -731,19 +797,81 @@ pub async fn codex_local_access_save_accounts(
 
 #[tauri::command]
 pub async fn codex_local_access_remove_account(
+    service_id: Option<String>,
     account_id: String,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::remove_local_access_account(&account_id).await
+    codex_local_access::remove_local_access_account(service_id, &account_id).await
 }
 
 #[tauri::command]
-pub async fn codex_local_access_rotate_api_key() -> Result<CodexLocalAccessState, String> {
-    codex_local_access::rotate_local_access_api_key().await
+pub async fn codex_local_access_create_api_key(
+    service_id: Option<String>,
+    name: String,
+    monthly_token_limit: Option<u64>,
+    upstream_scope: Option<String>,
+    allowed_account_ids: Option<Vec<String>>,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::create_local_access_api_key(
+        service_id,
+        name,
+        monthly_token_limit,
+        upstream_scope,
+        allowed_account_ids,
+    )
+    .await
 }
 
 #[tauri::command]
-pub async fn codex_local_access_clear_stats() -> Result<CodexLocalAccessState, String> {
-    codex_local_access::clear_local_access_stats().await
+pub async fn codex_local_access_update_api_key(
+    service_id: Option<String>,
+    api_key_id: String,
+    name: String,
+    enabled: bool,
+    monthly_token_limit: Option<u64>,
+    upstream_scope: Option<String>,
+    allowed_account_ids: Option<Vec<String>>,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::update_local_access_api_key(
+        service_id,
+        api_key_id,
+        name,
+        enabled,
+        monthly_token_limit,
+        upstream_scope,
+        allowed_account_ids,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_set_default_api_key(
+    service_id: Option<String>,
+    api_key_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::set_local_access_default_api_key(service_id, api_key_id).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_rotate_api_key(
+    service_id: Option<String>,
+    api_key_id: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::rotate_local_access_api_key(service_id, api_key_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_delete_api_key(
+    service_id: Option<String>,
+    api_key_id: String,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::delete_local_access_api_key(service_id, api_key_id).await
+}
+
+#[tauri::command]
+pub async fn codex_local_access_clear_stats(
+    service_id: Option<String>,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::clear_local_access_stats(service_id).await
 }
 
 #[tauri::command]
@@ -752,33 +880,44 @@ pub async fn codex_local_access_prepare_restart() -> Result<CodexLocalAccessStat
 }
 
 #[tauri::command]
-pub async fn codex_local_access_kill_port() -> Result<CodexLocalAccessPortCleanupResult, String> {
-    codex_local_access::kill_local_access_port_processes().await
+pub async fn codex_local_access_kill_port(
+    service_id: Option<String>,
+) -> Result<CodexLocalAccessPortCleanupResult, String> {
+    codex_local_access::kill_local_access_port_processes(service_id).await
 }
 
 #[tauri::command]
-pub async fn codex_local_access_update_port(port: u16) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_port(port).await
+pub async fn codex_local_access_update_port(
+    service_id: Option<String>,
+    port: u16,
+) -> Result<CodexLocalAccessState, String> {
+    codex_local_access::update_local_access_port(service_id, port).await
 }
 
 #[tauri::command]
 pub async fn codex_local_access_update_routing_strategy(
+    service_id: Option<String>,
     strategy: CodexLocalAccessRoutingStrategy,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::update_local_access_routing_strategy(strategy).await
+    codex_local_access::update_local_access_routing_strategy(service_id, strategy).await
 }
 
 #[tauri::command]
 pub async fn codex_local_access_set_enabled(
+    service_id: Option<String>,
     enabled: bool,
 ) -> Result<CodexLocalAccessState, String> {
-    codex_local_access::set_local_access_enabled(enabled).await
+    codex_local_access::set_local_access_enabled(service_id, enabled).await
 }
 
 #[tauri::command]
-pub async fn codex_local_access_activate(app: AppHandle) -> Result<CodexLocalAccessState, String> {
+pub async fn codex_local_access_activate(
+    app: AppHandle,
+    service_id: String,
+) -> Result<CodexLocalAccessState, String> {
     let codex_home = codex_account::get_codex_home();
-    let state = codex_local_access::activate_local_access_for_dir(&codex_home).await?;
+    let state =
+        codex_local_access::activate_local_access_for_dir(Some(service_id), &codex_home).await?;
 
     let mut index = codex_account::load_account_index();
     index.current_account_id = None;
