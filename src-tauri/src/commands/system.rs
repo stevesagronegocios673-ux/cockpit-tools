@@ -243,6 +243,14 @@ pub struct GeneralConfig {
     pub workbuddy_quota_alert_threshold: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntigravityInstalledVersionInfo {
+    pub product_name: String,
+    pub version: String,
+    pub app_path: String,
+    pub source: String,
+}
+
 /// 自动备份设置（前端使用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoBackupSettings {
@@ -298,6 +306,289 @@ const MAX_UI_SCALE: f64 = 2.0;
 const MAX_STARTUP_WAKEUP_DELAY_SECONDS: i32 = 24 * 60 * 60;
 const AUTO_SWITCH_ACCOUNT_SCOPE_ALL: &str = "all_accounts";
 const AUTO_SWITCH_ACCOUNT_SCOPE_SELECTED: &str = "selected_accounts";
+
+fn trim_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn json_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(trim_non_empty)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_app_root_for_metadata(path: &Path) -> Option<PathBuf> {
+    let path_str = path.to_string_lossy();
+    let app_idx = path_str.find(".app")?;
+    let root = PathBuf::from(&path_str[..app_idx + 4]);
+    root.exists().then_some(root)
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_plist_string(path: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("plutil")
+        .arg("-p")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let prefix = format!("\"{}\"", key);
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with(&prefix) {
+            continue;
+        }
+        let value = line.split("=>").nth(1)?.trim().trim_matches('"');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn antigravity_product_json_candidates(root: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            root.join("Contents")
+                .join("Resources")
+                .join("app")
+                .join("product.json"),
+            root.join("resources").join("app").join("product.json"),
+            root.join("app").join("product.json"),
+        ]
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![
+            root.join("resources").join("app").join("product.json"),
+            root.join("app").join("product.json"),
+        ]
+    }
+}
+
+fn read_antigravity_product_json_metadata(root: &Path) -> Option<AntigravityInstalledVersionInfo> {
+    for path in antigravity_product_json_candidates(root) {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(version) = json_string_field(&value, &["ideVersion", "version"]) else {
+            continue;
+        };
+        let product_name = json_string_field(
+            &value,
+            &["nameShort", "nameLong", "productName", "applicationName"],
+        )
+        .unwrap_or_else(|| "Antigravity".to_string());
+        return Some(AntigravityInstalledVersionInfo {
+            product_name,
+            version,
+            app_path: root.to_string_lossy().to_string(),
+            source: "product.json".to_string(),
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_antigravity_macos_bundle_metadata(root: &Path) -> Option<AntigravityInstalledVersionInfo> {
+    let plist_path = root.join("Contents").join("Info.plist");
+    if !plist_path.exists() {
+        return None;
+    }
+
+    let version = read_macos_plist_string(&plist_path, "CFBundleShortVersionString")
+        .or_else(|| read_macos_plist_string(&plist_path, "CFBundleVersion"))?;
+    let product_name = read_macos_plist_string(&plist_path, "CFBundleDisplayName")
+        .or_else(|| read_macos_plist_string(&plist_path, "CFBundleName"))
+        .unwrap_or_else(|| "Antigravity".to_string());
+
+    Some(AntigravityInstalledVersionInfo {
+        product_name,
+        version,
+        app_path: root.to_string_lossy().to_string(),
+        source: "Info.plist".to_string(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn find_antigravity_windows_exe(root: &Path) -> Option<PathBuf> {
+    if root.is_file() {
+        return Some(root.to_path_buf());
+    }
+
+    let candidates = [
+        root.join("Antigravity.exe"),
+        root.join("Antigravity IDE.exe"),
+        root.join("antigravity.exe"),
+        root.join("antigravity-ide.exe"),
+        root.join("Electron.exe"),
+    ];
+    candidates.into_iter().find(|path| path.exists())
+}
+
+#[cfg(target_os = "windows")]
+fn read_antigravity_windows_exe_metadata(root: &Path) -> Option<AntigravityInstalledVersionInfo> {
+    let exe_path = find_antigravity_windows_exe(root)?;
+    let script = r#"
+$p = $args[0]
+if (-not (Test-Path -LiteralPath $p)) { exit 2 }
+$v = (Get-Item -LiteralPath $p).VersionInfo
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[pscustomobject]@{
+  ProductName = $v.ProductName
+  ProductVersion = $v.ProductVersion
+  FileVersion = $v.FileVersion
+} | ConvertTo-Json -Compress
+"#;
+    let mut command = std::process::Command::new("powershell");
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .arg(&exe_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?;
+    let version = json_string_field(&value, &["ProductVersion", "FileVersion"])?;
+    let product_name =
+        json_string_field(&value, &["ProductName"]).unwrap_or_else(|| "Antigravity".to_string());
+
+    Some(AntigravityInstalledVersionInfo {
+        product_name,
+        version,
+        app_path: exe_path.to_string_lossy().to_string(),
+        source: "VersionInfo".to_string(),
+    })
+}
+
+fn normalize_antigravity_metadata_root(path: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(root) = normalize_macos_app_root_for_metadata(path) {
+            return Some(root);
+        }
+    }
+
+    if path.is_file() {
+        return path.parent().map(Path::to_path_buf);
+    }
+    if path.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    None
+}
+
+fn push_unique_antigravity_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    let normalized_key = path.to_string_lossy().to_ascii_lowercase();
+    let exists = candidates
+        .iter()
+        .any(|item| item.to_string_lossy().to_ascii_lowercase() == normalized_key);
+    if !exists {
+        candidates.push(path);
+    }
+}
+
+fn antigravity_metadata_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let config_path = config::get_user_config().antigravity_app_path;
+    let config_path = config_path.trim();
+    if !config_path.is_empty() {
+        if let Some(root) = normalize_antigravity_metadata_root(Path::new(config_path)) {
+            push_unique_antigravity_candidate(&mut candidates, root);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for path in [
+            "/Applications/Antigravity.app",
+            "/Applications/Antigravity IDE.app",
+        ] {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                push_unique_antigravity_candidate(&mut candidates, path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(local_appdata).join("Programs");
+            roots.push(base.join("Antigravity"));
+            roots.push(base.join("Antigravity IDE"));
+        }
+        if let Ok(program_files) = std::env::var("PROGRAMFILES") {
+            let base = PathBuf::from(program_files);
+            roots.push(base.join("Antigravity"));
+            roots.push(base.join("Antigravity IDE"));
+        }
+        if let Ok(program_files_x86) = std::env::var("PROGRAMFILES(X86)") {
+            let base = PathBuf::from(program_files_x86);
+            roots.push(base.join("Antigravity"));
+            roots.push(base.join("Antigravity IDE"));
+        }
+        for path in roots {
+            if path.exists() {
+                push_unique_antigravity_candidate(&mut candidates, path);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn resolve_antigravity_installed_version_info() -> Option<AntigravityInstalledVersionInfo> {
+    for root in antigravity_metadata_candidates() {
+        if let Some(info) = read_antigravity_product_json_metadata(&root) {
+            return Some(info);
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(info) = read_antigravity_macos_bundle_metadata(&root) {
+            return Some(info);
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(info) = read_antigravity_windows_exe_metadata(&root) {
+            return Some(info);
+        }
+    }
+
+    None
+}
 
 fn sanitize_startup_wakeup_delay_seconds(raw: i32) -> i32 {
     raw.clamp(0, MAX_STARTUP_WAKEUP_DELAY_SECONDS)
@@ -2005,6 +2296,12 @@ pub fn detect_app_path(app: String, force: Option<bool>) -> Result<Option<String
         )),
         _ => Err("未知应用类型".to_string()),
     }
+}
+
+#[tauri::command]
+pub fn get_antigravity_installed_version_info(
+) -> Result<Option<AntigravityInstalledVersionInfo>, String> {
+    Ok(resolve_antigravity_installed_version_info())
 }
 
 /// 通知插件关闭/开启唤醒功能（互斥）

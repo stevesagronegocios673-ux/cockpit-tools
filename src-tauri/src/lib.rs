@@ -405,6 +405,7 @@ pub fn run() {
             commands::system::set_codex_launch_on_switch,
             commands::system::set_codex_local_access_entry_visible,
             commands::system::detect_app_path,
+            commands::system::get_antigravity_installed_version_info,
             commands::system::set_wakeup_override,
             commands::system::handle_window_close,
             commands::system::show_floating_card_window,

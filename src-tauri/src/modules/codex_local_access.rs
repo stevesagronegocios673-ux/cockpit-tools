@@ -354,6 +354,16 @@ fn is_prepared_account_cache_valid(entry: &CachedPreparedAccount, now: i64) -> b
         && !codex_oauth::is_token_expired(&entry.account.tokens.access_token)
 }
 
+fn account_has_refresh_token(account: &CodexAccount) -> bool {
+    account
+        .tokens
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .is_some()
+}
+
 fn prune_prepared_account_cache(runtime: &mut GatewayRuntime, now: i64) {
     let allowed_account_ids = runtime.collection.as_ref().map(|collection| {
         collection
@@ -6673,6 +6683,31 @@ async fn proxy_request_with_account_pool(
                     }
                 };
 
+                if response.status() == StatusCode::UNAUTHORIZED
+                    && !account_has_refresh_token(&account)
+                {
+                    last_status = StatusCode::UNAUTHORIZED.as_u16();
+                    invalidate_prepared_account(&account_id).await;
+                    log_codex_api_failure(
+                        None,
+                        Some(request),
+                        Some(last_status),
+                        Some(account.id.as_str()),
+                        Some(account.email.as_str()),
+                        None,
+                        format!(
+                            "上游返回 401，access-token-only 账号缺少 refresh_token，按普通账号路径轮转: {}",
+                            account.email
+                        )
+                        .as_str(),
+                    );
+                    last_error = format!(
+                        "账号 {} 当前 access_token 不可用，且没有 refresh_token 可续期",
+                        account.email
+                    );
+                    break;
+                }
+
                 if response.status() == StatusCode::UNAUTHORIZED {
                     match force_refresh_gateway_account(&account_id).await {
                         Ok(refreshed_account) => {
@@ -6721,6 +6756,7 @@ async fn proxy_request_with_account_pool(
                             }
                         }
                         Err(err) => {
+                            last_status = StatusCode::UNAUTHORIZED.as_u16();
                             invalidate_prepared_account(&account_id).await;
                             log_codex_api_failure(
                                 None,

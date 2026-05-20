@@ -5,6 +5,7 @@ import { Page } from '../types/navigation';
 import { RobotIcon } from './icons/RobotIcon';
 import { ManualHelpIconButton } from './ManualHelpIconButton';
 import { TopCenterPromoBanner } from './TopCenterPromoBanner';
+import { AntigravityInstalledVersionBadge } from './AntigravityInstalledVersionBadge';
 import { PlatformId } from '../types/platform';
 import {
   findGroupByPlatform,
@@ -102,7 +103,9 @@ export function OverviewTabsHeader({
           <ManualHelpIconButton className="platform-header-help" onClick={onOpenManual} />
         </div>
         <TopCenterPromoBanner />
-        <div className="page-top-strip-right-placeholder" aria-hidden="true" />
+        <div className="page-top-strip-right">
+          <AntigravityInstalledVersionBadge />
+        </div>
       </div>
       <div className="page-tabs-row page-tabs-center page-tabs-row-with-leading">
         <div className="page-tabs-leading">
