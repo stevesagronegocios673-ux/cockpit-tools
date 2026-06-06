@@ -493,13 +493,27 @@ fn build_injection_script(models: &[ModelDescriptor]) -> Result<String, String> 
     return changed;
   }}
 
+  function patchModelNameArray(value) {{
+    if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) return false;
+    let changed = false;
+    for (const name of modelNames) {{
+      if (!value.includes(name)) {{
+        value.push(name);
+        changed = true;
+      }}
+    }}
+    return changed;
+  }}
+
   function patchContainer(value) {{
     if (!value || typeof value !== "object") return false;
     let changed = false;
     if (patchModelArray(value, true)) changed = true;
     if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value)) changed = true;
+    if (patchModelNameArray(value.models)) changed = true;
     if (patchModelArray(value.data, false)) changed = true;
     if (patchModelArray(value.result, false)) changed = true;
+    if (patchModelArray(value.pages?.[0]?.data, false)) changed = true;
     if (patchModelArray(value.result?.data, false)) changed = true;
     if (patchModelArray(value.result?.models, false)) changed = true;
     if (patchModelArray(value.message?.result?.data, false)) changed = true;
@@ -533,8 +547,61 @@ fn build_injection_script(models: &[ModelDescriptor]) -> Result<String, String> 
     if (("models" in value || "availableModels" in value || "available_models" in value) && value.defaultModel == null && defaultModel) {{
       value.defaultModel = descriptor(defaultModel);
       changed = true;
+    }} else if (typeof value.defaultModel === "string" && modelNames.includes(value.defaultModel) && value.model == null) {{
+      value.model = value.defaultModel;
+      changed = true;
     }}
     return changed;
+  }}
+
+  function patchObjectGraphForModels(root, visited, depth = 0) {{
+    if (!root || typeof root !== "object" || visited.has(root) || depth > 5) return false;
+    visited.add(root);
+    let changed = patchContainer(root);
+    if (root instanceof Element || root === window || root === document || root === document.body || root === document.documentElement) return changed;
+    for (const key of Object.keys(root)) {{
+      if (key === "ownerDocument" || key === "parentElement" || key === "parentNode" || key === "children" || key === "childNodes") continue;
+      let child;
+      try {{ child = root[key]; }} catch {{ continue; }}
+      if (child && typeof child === "object" && patchObjectGraphForModels(child, visited, depth + 1)) changed = true;
+    }}
+    return changed;
+  }}
+
+  function patchModelPayload(payload) {{
+    if (!payload || typeof payload !== "object") return payload;
+    try {{
+      patchContainer(payload);
+      patchObjectGraphForModels(payload, new WeakSet(), 0);
+    }} catch (error) {{
+      try {{ console.warn("[Cockpit Codex] model payload patch failed", error?.message || String(error)); }} catch {{}}
+    }}
+    return payload;
+  }}
+
+  function installResponseJsonPatch() {{
+    if (window.__cockpitModelResponseJsonPatched === "1") return;
+    const originalJson = Response.prototype.json;
+    if (typeof originalJson !== "function") return;
+    window.__cockpitModelResponseJsonPatched = "1";
+    Response.prototype.json = async function patchedCockpitModelResponseJson(...args) {{
+      const payload = await originalJson.apply(this, args);
+      return patchModelPayload(payload);
+    }};
+  }}
+
+  function reactFiberKeys(element) {{
+    return Object.keys(element || {{}}).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
+  }}
+
+  function patchReactModelState() {{
+    const visited = new WeakSet();
+    const nodes = [document.body, ...document.querySelectorAll("button, [role='menu'], [role='dialog'], [data-radix-popper-content-wrapper]")].filter(Boolean);
+    for (const node of nodes.slice(0, 220)) {{
+      for (const key of reactFiberKeys(node)) {{
+        patchObjectGraphForModels(node[key], visited, 0);
+      }}
+    }}
   }}
 
   function summarizeForLog(value, depth = 0) {{
@@ -613,7 +680,7 @@ fn build_injection_script(models: &[ModelDescriptor]) -> Result<String, String> 
       try {{
         const result = await original(method, params, options);
         if (actualMethod === "list-models-for-host") {{
-          patchContainer(result);
+          patchModelPayload(result);
         }}
         if (shouldTrace) {{
           try {{ console.info("[Cockpit Codex] app-server response", actualMethod, stringifyForLog(result)); }} catch {{}}
@@ -642,8 +709,10 @@ fn build_injection_script(models: &[ModelDescriptor]) -> Result<String, String> 
   }}
 
   function tick() {{
+    installResponseJsonPatch();
     patchStatsig();
     patchAppServerClient();
+    patchReactModelState();
   }}
   tick();
   setTimeout(tick, 300);
