@@ -206,7 +206,6 @@ interface DashboardCardCollapseState {
   workbuddy: boolean;
 }
 
-type DashboardCardId = PlatformId | 'api-relay';
 type DashboardEntryId = PlatformLayoutEntryId | ApiRelayLayoutEntryId;
 
 export function DashboardPage({
@@ -287,7 +286,6 @@ export function DashboardPage({
     apiRelayDashboardVisible,
     apiRelayEntryOrder,
     setHiddenEntry,
-    setApiRelayDashboardVisible,
   } = usePlatformLayoutStore();
   const apiRelayEntryEnabled = useSponsorStore((state) => Boolean(state.state.sponsorModule));
   const apiRelayDashboardEnabled = apiRelayEntryEnabled && apiRelayDashboardVisible;
@@ -2267,10 +2265,9 @@ export function DashboardPage({
 
   const visibleDashboardCardIds = useMemo(() => {
     const seen = new Set<PlatformId>();
-    const result: DashboardCardId[] = [];
+    const result: PlatformId[] = [];
     for (const entryId of visibleDashboardEntryOrder) {
       if (entryId === API_RELAY_LAYOUT_ENTRY_ID) {
-        result.push('api-relay');
         continue;
       }
       const platformId = resolveEntryDefaultPlatformId(entryId, platformGroups);
@@ -2288,7 +2285,7 @@ export function DashboardPage({
   }, [platformGroups, visibleDashboardEntryOrder]);
   const isSinglePlatformMode = visibleDashboardCardIds.length === 1;
   const cardRows = useMemo(() => {
-    const rows: DashboardCardId[][] = [];
+    const rows: PlatformId[][] = [];
     for (let i = 0; i < visibleDashboardCardIds.length; i += 2) {
       rows.push(visibleDashboardCardIds.slice(i, i + 2));
     }
@@ -2314,60 +2311,6 @@ export function DashboardPage({
     >
       <EyeOff size={14} />
     </button>
-  );
-
-  const renderApiRelayHideButton = () => (
-    <button
-      className="header-action-btn header-icon-btn"
-      onClick={() => setApiRelayDashboardVisible(false)}
-      title={t('accounts.compact.hide', '隐藏')}
-      aria-label={t('accounts.compact.hide', '隐藏')}
-    >
-      <EyeOff size={14} />
-    </button>
-  );
-
-  const renderApiRelayCard = () => (
-    <div className="main-card windsurf-card api-relay-dashboard-card" key="api-relay">
-      <div className="main-card-header">
-        <div className="header-title">
-          <img src={apiKeyFunIcon} alt="" className="dashboard-api-relay-icon" />
-          <h3>{t('nav.apiRelay', '中转站')}</h3>
-        </div>
-        <div className="header-action-group">
-          {renderApiRelayHideButton()}
-        </div>
-      </div>
-
-      <div className="split-content">
-        <div className="split-half current-half">
-          <span className="half-label">
-            <CheckCircle2 size={12} /> {t('dashboard.apiRelay.localConfig', '本地配置')}
-          </span>
-          <div className="empty-slot-text">
-            {t(
-              'dashboard.apiRelay.localConfigDesc',
-              '管理本地中转站配置、API Key 查询和一键写入客户端入口。',
-            )}
-          </div>
-        </div>
-
-        <div className="split-divider"></div>
-
-        <div className="split-half recommend-half">
-          <span className="half-label">
-            <Sparkles size={12} /> {t('dashboard.apiRelay.status', '配置状态')}
-          </span>
-          <div className="empty-slot-text">
-            {t('dashboard.apiRelay.enabledByConfig', '远端配置已开启')}
-          </div>
-        </div>
-      </div>
-
-      <button className="card-footer-action" onClick={() => onNavigate('api-relay')}>
-        {t('dashboard.apiRelay.openLocalConfig', '打开本地配置页')}
-      </button>
-    </div>
   );
 
   const renderPlatformCard = (platformId: PlatformId) => {
@@ -3159,7 +3102,7 @@ export function DashboardPage({
             key={`row-${rowIndex}`}
           >
             {row.map((cardId) => (
-              cardId === 'api-relay' ? renderApiRelayCard() : renderPlatformCard(cardId)
+              renderPlatformCard(cardId)
             ))}
             {!isSinglePlatformMode && row.length < 2 && <div className="main-card main-card-placeholder" />}
           </div>

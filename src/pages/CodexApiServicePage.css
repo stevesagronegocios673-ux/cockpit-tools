@@ -382,6 +382,108 @@
   letter-spacing: 0;
 }
 
+.codex-api-service-panel-desc {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.codex-api-service-compat-panel {
+  grid-column: 1 / -1;
+}
+
+.codex-api-service-compat-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(160px, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.codex-api-service-compat-item {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--codex-api-border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-surface) 82%, transparent);
+}
+
+.codex-api-service-compat-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.codex-api-service-compat-item-head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.codex-api-service-compat-item strong,
+.codex-api-service-compat-models span {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.25;
+}
+
+.codex-api-service-compat-item span,
+.codex-api-service-compat-item small {
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.codex-api-service-compat-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-api-service-compat-item code {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 74px;
+  padding: 8px;
+  border: 1px solid var(--codex-api-border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-secondary) 84%, transparent);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  white-space: pre;
+  overflow: auto;
+}
+
+.codex-api-service-compat-models {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--codex-api-border);
+}
+
+.codex-api-service-compat-models code {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .codex-api-service-title-with-icon,
 .codex-api-service-section-title {
   display: inline-flex;
@@ -1575,6 +1677,10 @@
     grid-template-columns: 1fr;
   }
 
+  .codex-api-service-compat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .codex-api-service-grid.accounts {
     grid-template-columns: 1fr;
   }
@@ -1684,6 +1790,15 @@
 @media (max-width: 620px) {
   .codex-api-service-health-grid {
     grid-template-columns: 1fr;
+  }
+
+  .codex-api-service-compat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .codex-api-service-compat-models {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .codex-api-service-panel-head,

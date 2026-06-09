@@ -6925,13 +6925,18 @@ fn try_launch_via_shortcut(shortcut_pattern: &str) -> Result<Option<u32>, String
         return Ok(None);
     };
 
-    let taskbar_dir = config_dir.join("Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar");
+    let taskbar_dir =
+        config_dir.join("Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar");
     if taskbar_dir.exists() {
         if let Ok(entries) = fs::read_dir(taskbar_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     let name_lower = name.to_lowercase();
                     if name_lower.contains(shortcut_pattern) && name_lower.ends_with(".lnk") {
                         crate::modules::logger::log_info(&format!(
@@ -6943,13 +6948,20 @@ fn try_launch_via_shortcut(shortcut_pattern: &str) -> Result<Option<u32>, String
                         cmd.arg("start");
                         cmd.arg("");
                         cmd.arg(&path);
-                        
+
                         use std::os::windows::process::CommandExt;
-                        cmd.creation_flags(0x08000000);
+                        cmd.creation_flags(CREATE_NO_WINDOW)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
                         match cmd.spawn() {
                             Ok(child) => {
-                                crate::modules::logger::log_info("[Shortcut Launch] 快捷方式启动命令已执行");
-                                return Ok(Some(child.id()));
+                                crate::modules::logger::log_info(
+                                    "[Shortcut Launch] 快捷方式启动命令已执行",
+                                );
+                                return Ok(Some(resolve_antigravity_pid_after_shortcut_launch(
+                                    child.id(),
+                                )));
                             }
                             Err(e) => {
                                 crate::modules::logger::log_warn(&format!(
@@ -6964,6 +6976,27 @@ fn try_launch_via_shortcut(shortcut_pattern: &str) -> Result<Option<u32>, String
         }
     }
     Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_antigravity_pid_after_shortcut_launch(command_pid: u32) -> u32 {
+    let probe_started = Instant::now();
+    let timeout = Duration::from_secs(6);
+    while probe_started.elapsed() < timeout {
+        if let Some(resolved_pid) = resolve_antigravity_pid(None, None) {
+            crate::modules::logger::log_info(&format!(
+                "[Shortcut Launch] 已解析 Antigravity PID: command_pid={}, resolved_pid={}",
+                command_pid, resolved_pid
+            ));
+            return resolved_pid;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    crate::modules::logger::log_warn(&format!(
+        "[Shortcut Launch] 启动后 6s 内未匹配到 Antigravity PID，回退 cmd pid={}",
+        command_pid
+    ));
+    command_pid
 }
 
 #[cfg(target_os = "windows")]

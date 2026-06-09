@@ -7,6 +7,24 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.25.6] - 2026-06-09
+
+### Added
+- **Codex API Service now exposes broader protocol-compatible endpoints**: the same local service can serve OpenAI Chat and Responses, Anthropic Messages and token counting, Gemini model/generation/count-token routes, and Ollama model/chat routes, with provider-gateway translation for Chat Completions-backed accounts.
+- **Codex API Service now shows protocol connection examples**: the API Service page lists copyable OpenAI, Responses, Anthropic, Gemini, and Ollama environment snippets plus the supported model-catalog endpoints.
+
+### Changed
+- **Codex account deletion is now lightweight for large account sets**: deleting accounts removes the account records and the API Service main account-pool entries without scanning remaining accounts, clearing deep API Service references, or reloading the gateway.
+- **Codex batch file import skips quota checks by default**: file import now parses files into the existing selectable preview list first, keeps quota checks behind an opt-in toggle, and preserves the import-selected flow.
+- **Codex account bulk actions can now target all matching results**: after selecting the current page, users can explicitly select every account matching the current filters before deleting or moving them to a group.
+
+### Fixed
+- **Codex Chat Completions providers can start through their instance provider gateway again**: provider-gateway accounts now use their own eligibility check while the global API Service regular account pool continues to exclude Chat Completions API Key accounts.
+- **Codex quota refresh failures now update the account list state**: when a usage request records a quota error such as an invalidated token, the account list and current account state are reloaded even though the refresh action returns an error.
+- **Windows Antigravity shortcut launches now resolve the real app process more reliably**: launching through a pinned shortcut hides the helper console output and waits briefly for the actual Antigravity PID instead of returning only the transient `cmd` process.
+- **Windows Antigravity account switching and auto-start no longer create duplicate taskbar icons**: launching through the managed shortcut path now avoids leaving an extra taskbar entry during account switching or automatic startup.
+
+---
 ## [0.25.5] - 2026-06-08
 
 ### Changed

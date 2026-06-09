@@ -6815,7 +6815,12 @@ async fn prepare_sidecar_launch_config_in_dir(
             ));
             continue;
         };
-        if !is_local_access_eligible_account(&account, collection.restrict_free_accounts) {
+        let eligible = if collection_uses_provider_gateway_account(collection, &account.id) {
+            is_provider_gateway_eligible_account(&account)
+        } else {
+            is_local_access_eligible_account(&account, collection.restrict_free_accounts)
+        };
+        if !eligible {
             continue;
         }
 
@@ -9058,6 +9063,11 @@ fn sanitize_collection_with_accounts(
         })
         .map(|account| account.id.clone())
         .collect();
+    let valid_provider_gateway_account_ids: HashSet<String> = accounts
+        .iter()
+        .filter(|account| is_provider_gateway_eligible_account(account))
+        .map(|account| account.id.clone())
+        .collect();
 
     let normalized_bound_oauth_account_id =
         normalize_optional_account_ref(collection.bound_oauth_account_id.as_deref());
@@ -9092,9 +9102,14 @@ fn sanitize_collection_with_accounts(
 
     for api_key in &mut collection.api_keys {
         let before = api_key.account_ids.clone();
+        let valid_scope_account_ids = if api_key.provider_gateway.is_some() {
+            &valid_provider_gateway_account_ids
+        } else {
+            &valid_account_ids
+        };
         api_key
             .account_ids
-            .retain(|account_id| valid_account_ids.contains(account_id));
+            .retain(|account_id| valid_scope_account_ids.contains(account_id));
         if api_key.account_ids != before {
             changed = true;
         }
@@ -10486,6 +10501,23 @@ pub fn account_requires_provider_gateway(account: &CodexAccount) -> bool {
         && provider_gateway_wire_api_for_account(account) == "chat_completions"
 }
 
+fn is_provider_gateway_eligible_account(account: &CodexAccount) -> bool {
+    account_requires_provider_gateway(account)
+}
+
+fn collection_uses_provider_gateway_account(
+    collection: &CodexLocalAccessCollection,
+    account_id: &str,
+) -> bool {
+    collection.api_keys.iter().any(|item| {
+        item.provider_gateway.is_some()
+            && item
+                .account_ids
+                .iter()
+                .any(|candidate| candidate == account_id)
+    })
+}
+
 fn provider_gateway_for_account(
     account: &CodexAccount,
 ) -> Result<CodexLocalAccessProviderGateway, String> {
@@ -10584,7 +10616,7 @@ fn build_provider_gateway_collection_for_profile(
     collection.api_keys.clear();
     collection.bound_oauth_account_id = None;
 
-    if !is_local_access_eligible_account(account, collection.restrict_free_accounts) {
+    if !is_provider_gateway_eligible_account(account) {
         return Err("该供应商账号不符合本地网关使用条件".to_string());
     }
 
@@ -12506,6 +12538,40 @@ pub async fn remove_local_access_account(
     account_id: &str,
 ) -> Result<CodexLocalAccessState, String> {
     remove_local_access_accounts(&[account_id.to_string()]).await
+}
+
+pub async fn remove_deleted_accounts_from_local_access_pool(
+    account_ids: &[String],
+) -> Result<(), String> {
+    let remove_ids = account_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    if remove_ids.is_empty() {
+        return Ok(());
+    }
+
+    let Some(mut collection) = load_collection_from_disk()? else {
+        return Ok(());
+    };
+
+    let before_account_ids = collection.account_ids.clone();
+    collection.account_ids.retain(|id| !remove_ids.contains(id));
+    if collection.account_ids == before_account_ids {
+        return Ok(());
+    }
+
+    collection.updated_at = now_ms();
+    save_collection_to_disk(&collection)?;
+
+    let mut runtime = gateway_runtime().lock().await;
+    if runtime.loaded {
+        sync_runtime_collection(&mut runtime, collection);
+    }
+
+    Ok(())
 }
 
 pub async fn remove_local_access_accounts(
@@ -17401,17 +17467,19 @@ mod tests {
         extract_usage_capture, inspect_local_access_profile_config,
         is_codex_local_access_auth_text, is_codex_local_access_config_for_api_key,
         is_image_generation_capability_error, is_local_access_eligible_account,
-        is_responses_completion_event, is_stream_incomplete_error_message,
-        is_upstream_response_failed_error_message, legacy_stream_error_category,
-        local_access_chat_completions_url, macos_proxy_url_from_scutil_map,
-        merge_collection_and_account_excluded_models, model_pricing, normalize_account_model_rules,
-        normalize_custom_routing_rules, normalized_sidecar_error_category, parse_codex_retry_after,
+        is_provider_gateway_eligible_account, is_responses_completion_event,
+        is_stream_incomplete_error_message, is_upstream_response_failed_error_message,
+        legacy_stream_error_category, local_access_chat_completions_url,
+        macos_proxy_url_from_scutil_map, merge_collection_and_account_excluded_models,
+        model_pricing, normalize_account_model_rules, normalize_custom_routing_rules,
+        normalized_sidecar_error_category, parse_codex_retry_after,
         parse_responses_payload_from_upstream, parse_websocket_upstream_error,
         prepare_gateway_request, profile_base_url_matches,
         provider_gateway_default_model_for_account, provider_gateway_models_for_account,
         read_http_request, recover_invalid_stats_file, remove_account_refs_from_collection,
         remove_codex_local_access_config, resolve_plan_rank, resolve_supported_model_alias,
-        resolve_upstream_target, restore_config_toml_from_takeover_backup, scutil_proxy_map,
+        resolve_upstream_target, restore_config_toml_from_takeover_backup,
+        sanitize_collection_with_accounts, scutil_proxy_map,
         should_retry_single_account_upstream_status, should_treat_response_as_stream,
         should_try_next_account, sidecar_codex_api_key_auth_id, sidecar_config_fingerprint,
         sidecar_stable_id, system_proxy_target_scheme, system_proxy_value_url,
@@ -20484,6 +20552,62 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
         account.api_wire_api = Some("chat_completions".to_string());
 
         assert!(!is_local_access_eligible_account(&account, false));
+    }
+
+    #[test]
+    fn chat_completions_api_key_accounts_are_eligible_for_provider_gateway() {
+        let mut account = CodexAccount::new_api_key(
+            "api-1".to_string(),
+            "api-key@example.com".to_string(),
+            "sk-test".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.deepseek.com/v1".to_string()),
+            Some("deepseek".to_string()),
+            Some("DeepSeek".to_string()),
+            Vec::new(),
+        );
+        account.api_wire_api = Some("chat_completions".to_string());
+
+        assert!(!is_local_access_eligible_account(&account, false));
+        assert!(is_provider_gateway_eligible_account(&account));
+    }
+
+    #[test]
+    fn sanitize_collection_keeps_provider_gateway_account_scope() {
+        let mut account = CodexAccount::new_api_key(
+            "api-1".to_string(),
+            "api-key@example.com".to_string(),
+            "sk-test".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.deepseek.com/v1".to_string()),
+            Some("deepseek".to_string()),
+            Some("DeepSeek".to_string()),
+            Vec::new(),
+        );
+        account.api_wire_api = Some("chat_completions".to_string());
+        let account_id = account.id.clone();
+
+        let mut collection = test_local_access_collection(vec![account_id.clone()]);
+        let mut api_key = build_local_access_api_key(Some("Provider Gateway"));
+        api_key.provider_gateway = Some(CodexLocalAccessProviderGateway {
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            upstream_model: "deepseek-v4-pro".to_string(),
+            upstream_models: vec!["deepseek-v4-pro".to_string()],
+            wire_api: Some("chat_completions".to_string()),
+            supports_vision: false,
+            model_capabilities: HashMap::new(),
+            vision_routing_model: None,
+        });
+        api_key.account_ids = vec![account_id.clone()];
+        collection.api_keys = vec![api_key];
+
+        sanitize_collection_with_accounts(&mut collection, &[account])
+            .expect("collection should sanitize");
+
+        assert!(collection.account_ids.is_empty());
+        assert_eq!(collection.api_keys.len(), 1);
+        assert_eq!(collection.api_keys[0].account_ids, vec![account_id]);
     }
 
     #[test]

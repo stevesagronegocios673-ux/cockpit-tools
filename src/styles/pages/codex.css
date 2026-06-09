@@ -45,6 +45,60 @@
   color: var(--text-primary);
 }
 
+.codex-overview-selection-left,
+.codex-overview-selection-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.codex-overview-selected-count {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.codex-overview-select-filtered-btn,
+.codex-overview-clear-selection-btn {
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  padding: 4px 2px;
+}
+
+.codex-overview-clear-selection-btn {
+  color: var(--text-secondary);
+}
+
+.codex-overview-select-filtered-btn:hover,
+.codex-overview-clear-selection-btn:hover {
+  text-decoration: underline;
+}
+
+.codex-overview-selection-actions .btn.icon-only {
+  width: 36px;
+  min-height: 36px;
+  border-radius: 12px;
+}
+
+.codex-overview-selection-actions .codex-overview-clear-error-btn {
+  background: #ef4444;
+  border-color: rgba(239, 68, 68, 0.42);
+}
+
 .codex-overview-select-all input[type="checkbox"] {
   width: 16px;
   height: 16px;

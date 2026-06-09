@@ -396,6 +396,7 @@ QQ 交流群、微信群或新建的 Telegram 畅聊群都可以加入。
 
 - Antigravity 账号切号逻辑参考：[Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)
 - Codex API 服务参考并集成：[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+- Codex API 服务协议兼容方向参考：[codex-proxy](https://github.com/icebear0828/codex-proxy)
 - Codex 第三方供应商预设参考：[CC Switch](https://github.com/farion1231/cc-switch)
 - Codex 模型目录与前端模型显示思路参考：[CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)
 

@@ -7,6 +7,24 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
 ---
+## [0.25.6] - 2026-06-09
+
+### 新增
+- **Codex API 服务现提供更完整的协议兼容入口**：同一个本地服务可提供 OpenAI Chat 与 Responses、Anthropic Messages 与 token 统计、Gemini 模型/生成/token 统计，以及 Ollama 模型/对话接口；Chat Completions 后端账号也支持 provider gateway 协议转换。
+- **Codex API 服务现展示协议连接示例**：API 服务页面新增可复制的 OpenAI、Responses、Anthropic、Gemini 与 Ollama 环境变量片段，并标出支持的模型目录入口。
+
+### 变更
+- **Codex 大账号量删除改为轻量路径**：删除账号只移除账号记录和 API 服务主账号池条目，不再扫描剩余账号、清理 API 服务深层引用或重载网关。
+- **Codex 批量文件导入默认不检测账号额度**：文件导入会先解析并展示可选择账号列表，默认跳过额度检测并可通过开关恢复检测，导入选中账号的原有交互保持一致。
+- **Codex 账号批量操作可作用于全部匹配结果**：全选当前页后可显式选择当前筛选条件下的所有账号，再执行删除或移动分组。
+
+### 修复
+- **Codex Chat Completions 协议供应商可重新通过实例专属 provider gateway 启动**：provider gateway 账号现使用独立资格校验，同时全局 API 服务普通账号池仍会继续拦截 Chat Completions API Key 账号。
+- **Codex 配额刷新失败后也会更新账号列表状态**：当 usage 请求写入 token 已失效等配额错误时，即使刷新操作返回失败，也会重新拉取账号列表和当前账号状态。
+- **Windows Antigravity 快捷方式启动能更可靠地解析真实应用进程**：通过固定快捷方式启动时会隐藏辅助控制台输出，并短暂等待实际 Antigravity PID，不再只返回临时 `cmd` 进程。
+- **Windows Antigravity 账号切换和自动启动不再出现重复任务栏图标**：通过受管快捷方式启动时会避免在切号或自动启动过程中留下额外的任务栏入口。
+
+---
 ## [0.25.5] - 2026-06-08
 
 ### 变更

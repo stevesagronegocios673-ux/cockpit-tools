@@ -1488,6 +1488,156 @@ func TestRelayServerTimesOutIdleOpenedStream(t *testing.T) {
 	}
 }
 
+func TestRelayServerAnthropicMessagesUsesClaudeFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtime := &fakeRuntime{
+		response: cliproxyexecutor.Response{
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Payload: []byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`),
+		},
+	}
+	router := testRelayRouter(runtime)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":false}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if runtime.executeCalls != 1 || runtime.lastOpts.SourceFormat != sdktranslator.FormatClaude || runtime.lastReq.Format != sdktranslator.FormatClaude {
+		t.Fatalf("expected Claude executor request, got calls=%d req=%#v opts=%#v", runtime.executeCalls, runtime.lastReq, runtime.lastOpts)
+	}
+}
+
+func TestRelayServerAnthropicCountTokensUsesClaudeShape(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := testRelayRouter(&fakeRuntime{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello world"}]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"input_tokens"`) {
+		t.Fatalf("Anthropic token count response should use input_tokens: %s", w.Body.String())
+	}
+}
+
+func TestRelayServerGeminiGenerateInjectsPathModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtime := &fakeRuntime{
+		response: cliproxyexecutor.Response{
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Payload: []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]}}]}`),
+		},
+	}
+	router := testRelayRouter(runtime)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gpt-5.5:generateContent", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if runtime.executeCalls != 1 || runtime.lastOpts.SourceFormat != sdktranslator.FormatGemini || runtime.lastReq.Model != "gpt-5.5" {
+		t.Fatalf("expected Gemini executor request, got calls=%d req=%#v opts=%#v", runtime.executeCalls, runtime.lastReq, runtime.lastOpts)
+	}
+	if !strings.Contains(string(runtime.lastReq.Payload), `"model":"gpt-5.5"`) {
+		t.Fatalf("Gemini path model should be injected into executor payload: %s", runtime.lastReq.Payload)
+	}
+}
+
+func TestRelayServerGeminiModelsResponseShape(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := testRelayRouter(&fakeRuntime{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1beta/models", nil)
+	req.Header.Set("Authorization", "Bearer client-key")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"name":"models/gpt-5.5"`) ||
+		!strings.Contains(w.Body.String(), `"streamGenerateContent"`) ||
+		!strings.Contains(w.Body.String(), `"countTokens"`) {
+		t.Fatalf("Gemini models response has unexpected shape: %s", w.Body.String())
+	}
+}
+
+func TestRelayServerOllamaChatConvertsNonStreamingResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	runtime := &fakeRuntime{
+		response: cliproxyexecutor.Response{
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Payload: []byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"gpt-5.5","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`),
+		},
+	}
+	router := testRelayRouter(runtime)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":false}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if runtime.executeCalls != 1 || runtime.lastOpts.SourceFormat != sdktranslator.FormatOpenAI || runtime.lastReq.Model != "gpt-5.5" {
+		t.Fatalf("expected OpenAI chat executor request, got calls=%d req=%#v opts=%#v", runtime.executeCalls, runtime.lastReq, runtime.lastOpts)
+	}
+	if !strings.Contains(w.Body.String(), `"done":true`) || !strings.Contains(w.Body.String(), `"content":"ok"`) || !strings.Contains(w.Body.String(), `"eval_count":3`) {
+		t.Fatalf("Ollama response has unexpected shape: %s", w.Body.String())
+	}
+}
+
+func TestRelayServerOllamaChatConvertsStreamingChunks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}`)}
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"gpt-5.5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`)}
+	close(chunks)
+	runtime := &fakeRuntime{
+		streamResult: &cliproxyexecutor.StreamResult{
+			Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Chunks:  chunks,
+		},
+	}
+	router := testRelayRouter(runtime)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if runtime.streamCalls != 1 || runtime.lastOpts.SourceFormat != sdktranslator.FormatOpenAI {
+		t.Fatalf("expected OpenAI chat stream executor request, got calls=%d opts=%#v", runtime.streamCalls, runtime.lastOpts)
+	}
+	lines := strings.Split(strings.TrimSpace(w.Body.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected content and final Ollama chunks, got %d lines: %s", len(lines), w.Body.String())
+	}
+	if !strings.Contains(lines[0], `"content":"ok"`) || !strings.Contains(lines[1], `"done":true`) || !strings.Contains(lines[1], `"eval_count":3`) {
+		t.Fatalf("unexpected Ollama stream body: %s", w.Body.String())
+	}
+}
+
 func TestRelayServerHandlesCORSPreflight(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := testRelayRouter(&fakeRuntime{})

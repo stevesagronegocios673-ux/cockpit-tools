@@ -358,7 +358,7 @@ async fn run_codex_post_refresh_checks(app: &AppHandle) {
 #[tauri::command]
 pub async fn delete_codex_account(account_id: String) -> Result<(), String> {
     codex_account::remove_account(&account_id)?;
-    codex_local_access::remove_local_access_accounts(&[account_id]).await?;
+    codex_local_access::remove_deleted_accounts_from_local_access_pool(&[account_id]).await?;
     Ok(())
 }
 
@@ -366,7 +366,7 @@ pub async fn delete_codex_account(account_id: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn delete_codex_accounts(account_ids: Vec<String>) -> Result<(), String> {
     codex_account::remove_accounts(&account_ids)?;
-    codex_local_access::remove_local_access_accounts(&account_ids).await?;
+    codex_local_access::remove_deleted_accounts_from_local_access_pool(&account_ids).await?;
     Ok(())
 }
 
@@ -454,8 +454,9 @@ pub async fn import_codex_from_files(
 pub fn start_codex_batch_import_from_files(
     app: AppHandle,
     file_paths: Vec<String>,
+    check_quota: bool,
 ) -> Result<codex_account::CodexBatchImportStartResult, String> {
-    codex_account::start_codex_batch_import_from_files(app, file_paths)
+    codex_account::start_codex_batch_import_from_files(app, file_paths, check_quota)
 }
 
 #[tauri::command]

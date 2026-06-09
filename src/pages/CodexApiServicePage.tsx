@@ -90,6 +90,7 @@ type CopyField =
   | "lanBaseUrl"
   | "apiKey"
   | "modelId"
+  | `compat:${string}`
   | `apiKey:${string}`;
 type RequestLogKindFilter = "all" | CodexLocalAccessRequestKind;
 type RequestLogStatusFilter = "all" | "success" | "failed";
@@ -671,6 +672,90 @@ export function CodexApiServicePage() {
   const routingStrategy = collection?.routingStrategy ?? "auto";
   const gatewayMode = collection?.gatewayMode ?? "sidecar";
   const modelIds = state?.modelIds ?? [];
+  const exampleModelId = modelIds[0] ?? "gpt-5.5";
+  const exampleApiKey = collection?.apiKey || "<api-key>";
+  const compatibilityExamples = useMemo(
+    () => [
+      {
+        id: "openai",
+        title: t(
+          "codex.apiService.compat.openaiTitle",
+          "OpenAI Compatible",
+        ),
+        endpoint: "/v1/chat/completions",
+        note: t(
+          "codex.apiService.compat.openaiNote",
+          "Base URL uses /v1.",
+        ),
+        value: [
+          `OPENAI_BASE_URL=${displayBaseUrl}/v1`,
+          `OPENAI_API_KEY=${exampleApiKey}`,
+          `OPENAI_MODEL=${exampleModelId}`,
+        ].join("\n"),
+      },
+      {
+        id: "responses",
+        title: t("codex.apiService.compat.responsesTitle", "Responses"),
+        endpoint: "/v1/responses",
+        note: t(
+          "codex.apiService.compat.responsesNote",
+          "Codex-native Responses entry.",
+        ),
+        value: [
+          `OPENAI_BASE_URL=${displayBaseUrl}/v1`,
+          `OPENAI_API_KEY=${exampleApiKey}`,
+          `OPENAI_MODEL=${exampleModelId}`,
+          "OPENAI_API_ENDPOINT=/responses",
+        ].join("\n"),
+      },
+      {
+        id: "anthropic",
+        title: t(
+          "codex.apiService.compat.anthropicTitle",
+          "Anthropic Messages",
+        ),
+        endpoint: "/v1/messages",
+        note: t(
+          "codex.apiService.compat.anthropicNote",
+          "Use the same service key.",
+        ),
+        value: [
+          `ANTHROPIC_BASE_URL=${displayBaseUrl}`,
+          `ANTHROPIC_API_KEY=${exampleApiKey}`,
+          `ANTHROPIC_MODEL=${exampleModelId}`,
+        ].join("\n"),
+      },
+      {
+        id: "gemini",
+        title: t("codex.apiService.compat.geminiTitle", "Gemini"),
+        endpoint: "/v1beta/models",
+        note: t(
+          "codex.apiService.compat.geminiNote",
+          "Base URL uses /v1beta.",
+        ),
+        value: [
+          `GEMINI_BASE_URL=${displayBaseUrl}/v1beta`,
+          `GEMINI_API_KEY=${exampleApiKey}`,
+          `GEMINI_MODEL=${exampleModelId}`,
+        ].join("\n"),
+      },
+      {
+        id: "ollama",
+        title: t("codex.apiService.compat.ollamaTitle", "Ollama Bridge"),
+        endpoint: "/api/chat",
+        note: t(
+          "codex.apiService.compat.ollamaNote",
+          "Use Authorization: Bearer.",
+        ),
+        value: [
+          `OLLAMA_HOST=${displayBaseUrl}`,
+          `OLLAMA_API_KEY=${exampleApiKey}`,
+          `OLLAMA_MODEL=${exampleModelId}`,
+        ].join("\n"),
+      },
+    ],
+    [displayBaseUrl, exampleApiKey, exampleModelId, t],
+  );
   const modelPricingRows = useMemo<ModelPricingRow[]>(() => {
     const presetMap = new Map<string, CodexLocalAccessModelPricing>();
     const customMap = new Map<string, CodexLocalAccessModelPricing>();
@@ -2775,6 +2860,64 @@ export function CodexApiServicePage() {
                     </span>
                   ))
                 )}
+              </div>
+            </section>
+
+            <section className="codex-api-service-panel codex-api-service-compat-panel">
+              <div className="codex-api-service-panel-head">
+                <div>
+                  <h2>
+                    {t(
+                      "codex.apiService.compat.title",
+                      "协议兼容",
+                    )}
+                  </h2>
+                  <p className="codex-api-service-panel-desc">
+                    {t(
+                      "codex.apiService.compat.desc",
+                      "同一个 API 服务地址支持 OpenAI Chat、Responses、Anthropic Messages、Gemini 和 Ollama 入口。",
+                    )}
+                  </p>
+                </div>
+              </div>
+              <div className="codex-api-service-compat-grid">
+                {compatibilityExamples.map((item) => {
+                  const copyField: CopyField = `compat:${item.id}`;
+                  return (
+                    <div key={item.id} className="codex-api-service-compat-item">
+                      <div className="codex-api-service-compat-item-head">
+                        <div>
+                          <strong>{item.title}</strong>
+                          <span>{item.endpoint}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="folder-icon-btn"
+                          onClick={() => void handleCopy(copyField, item.value)}
+                          disabled={!displayBaseUrl}
+                          title={t("common.copy", "复制")}
+                        >
+                          {copiedField === copyField ? (
+                            <Check size={14} />
+                          ) : (
+                            <Copy size={14} />
+                          )}
+                        </button>
+                      </div>
+                      <code>{item.value}</code>
+                      <small>{item.note}</small>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="codex-api-service-compat-models">
+                <span>
+                  {t(
+                    "codex.apiService.compat.modelCatalogLabel",
+                    "模型目录",
+                  )}
+                </span>
+                <code>/v1/models · /v1beta/models · /api/tags</code>
               </div>
             </section>
           </div>

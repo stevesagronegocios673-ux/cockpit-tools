@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -58,6 +59,14 @@ const defaultImagesMainModel = "gpt-5.4-mini"
 const defaultImagesToolModel = "gpt-image-2"
 const imagesGenerationsPath = "/v1/images/generations"
 const imagesEditsPath = "/v1/images/edits"
+const anthropicMessagesPath = "/v1/messages"
+const anthropicCountTokensPath = "/v1/messages/count_tokens"
+const geminiModelsPath = "/v1beta/models"
+const ollamaVersionPath = "/api/version"
+const ollamaTagsPath = "/api/tags"
+const ollamaShowPath = "/api/show"
+const ollamaChatPath = "/api/chat"
+const ollamaBridgeVersion = "0.18.3"
 const maxImageUploadBytes int64 = 64 * 1024 * 1024
 
 var (
@@ -768,6 +777,115 @@ func buildModelsResponse(models []string) gin.H {
 	return gin.H{"object": "list", "data": data}
 }
 
+func buildGeminiModelsResponse(models []string) gin.H {
+	data := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		data = append(data, buildGeminiModelEntry(model))
+	}
+	return gin.H{"models": data}
+}
+
+func buildGeminiModelEntry(model string) gin.H {
+	displayName := displayNameForModel(model)
+	return gin.H{
+		"name":                       "models/" + model,
+		"baseModelId":                model,
+		"version":                    "001",
+		"displayName":                displayName,
+		"description":                displayName,
+		"inputTokenLimit":            1000000,
+		"outputTokenLimit":           128000,
+		"supportedGenerationMethods": []string{"generateContent", "streamGenerateContent", "countTokens"},
+	}
+}
+
+func buildOllamaTagsResponse(models []string, modifiedAt time.Time) gin.H {
+	data := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		data = append(data, buildOllamaTag(model, modifiedAt))
+	}
+	return gin.H{"models": data}
+}
+
+func buildOllamaTag(model string, modifiedAt time.Time) gin.H {
+	family := ollamaModelFamily(model)
+	return gin.H{
+		"name":        model,
+		"model":       model,
+		"modified_at": modifiedAt.Format(time.RFC3339Nano),
+		"size":        0,
+		"digest":      fmt.Sprintf("%x", sha256.Sum256([]byte(model))),
+		"details": gin.H{
+			"parent_model":       "",
+			"format":             "cockpit-codex-api-service",
+			"family":             family,
+			"families":           []string{family},
+			"parameter_size":     "unknown",
+			"quantization_level": "unknown",
+		},
+	}
+}
+
+func buildOllamaShowResponse(model string, modifiedAt time.Time) gin.H {
+	family := ollamaModelFamily(model)
+	contextLength := ollamaContextLength(model)
+	return gin.H{
+		"model":        model,
+		"remote_model": model,
+		"license":      "Proxied via Cockpit Codex API Service",
+		"modelfile":    "FROM " + model,
+		"parameters":   fmt.Sprintf("num_ctx %d", contextLength),
+		"template":     "{{ .Prompt }}",
+		"capabilities": []string{
+			"completion",
+			"tools",
+			"thinking",
+		},
+		"modified_at": modifiedAt.Format(time.RFC3339Nano),
+		"details":     buildOllamaTag(model, modifiedAt)["details"],
+		"model_info": gin.H{
+			"general.architecture":        family,
+			family + ".context_length":    contextLength,
+			"general.basename":            model,
+			"upstream_id":                 model,
+			"display_name":                displayNameForModel(model),
+			"input_modalities":            []string{"text", "image"},
+			"context_length":              contextLength,
+			"supported_reasoning_efforts": []string{"low", "medium", "high"},
+			"default_reasoning_effort":    "medium",
+		},
+	}
+}
+
+func ollamaModelFamily(model string) string {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	for _, prefix := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5.1", "gpt-oss", "codex"} {
+		if strings.HasPrefix(normalized, prefix) {
+			return prefix
+		}
+	}
+	for _, sep := range []string{":", "/", "-"} {
+		if index := strings.Index(normalized, sep); index > 0 {
+			return normalized[:index]
+		}
+	}
+	if normalized == "" {
+		return "codex"
+	}
+	return normalized
+}
+
+func ollamaContextLength(model string) int {
+	switch {
+	case strings.HasPrefix(model, "gpt-5.5"), strings.HasPrefix(model, "gpt-5.4"):
+		return 400000
+	case strings.HasPrefix(model, "gpt-5.3"), strings.HasPrefix(model, "gpt-5.2"), strings.HasPrefix(model, "gpt-5.1"):
+		return 272000
+	default:
+		return 131072
+	}
+}
+
 func buildCodexClientModelsResponse(models []string) gin.H {
 	sourceModels := make([]map[string]any, 0, len(models))
 	for _, model := range models {
@@ -1231,7 +1349,11 @@ func requestKindFromPath(path string) string {
 		return "image_generation"
 	case strings.Contains(path, "/images/edits"):
 		return "image_edit"
-	case strings.Contains(path, "/chat/completions"), strings.Contains(path, "/responses"):
+	case strings.Contains(path, "/chat/completions"),
+		strings.Contains(path, "/responses"),
+		strings.Contains(path, "/v1/messages"),
+		strings.Contains(path, "/v1beta/models"),
+		strings.Contains(path, "/api/chat"):
 		return "text"
 	default:
 		return "other"
@@ -2146,8 +2268,17 @@ func (s *relayServer) router() *gin.Engine {
 	router.POST("/v1/responses", s.handleResponses)
 	router.POST("/v1/responses/compact", s.handleResponsesCompact)
 	router.POST("/v1/chat/completions", s.handleChatCompletions)
+	router.POST(anthropicMessagesPath, s.handleAnthropicMessages)
+	router.POST(anthropicCountTokensPath, s.handleAnthropicCountTokens)
+	router.GET(geminiModelsPath, s.handleGeminiModels)
+	router.GET(geminiModelsPath+"/*action", s.handleGeminiModel)
+	router.POST(geminiModelsPath+"/*action", s.handleGeminiAction)
 	router.POST(imagesGenerationsPath, s.handleImagesGenerations)
 	router.POST(imagesEditsPath, s.handleImagesEdits)
+	router.GET(ollamaVersionPath, s.handleOllamaVersion)
+	router.GET(ollamaTagsPath, s.handleOllamaTags)
+	router.POST(ollamaShowPath, s.handleOllamaShow)
+	router.POST(ollamaChatPath, s.handleOllamaChat)
 	router.NoRoute(func(c *gin.Context) {
 		writeAPIError(c, http.StatusNotFound, "endpoint not supported", "not_found")
 	})
@@ -2190,6 +2321,78 @@ func (s *relayServer) handleResponsesCompact(c *gin.Context) {
 
 func (s *relayServer) handleChatCompletions(c *gin.Context) {
 	s.handleExecutorRequest(c, sdktranslator.FormatOpenAI, "")
+}
+
+func (s *relayServer) handleAnthropicMessages(c *gin.Context) {
+	s.handleExecutorRequest(c, sdktranslator.FormatClaude, "")
+}
+
+func (s *relayServer) handleAnthropicCountTokens(c *gin.Context) {
+	s.handleTokenCount(c, sdktranslator.FormatClaude, "")
+}
+
+func (s *relayServer) handleGeminiModels(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, buildGeminiModelsResponse(clientCatalogModelsForAPIKey(s.manifest, spec)))
+}
+
+func (s *relayServer) handleGeminiModel(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	model, method, parseOK := parseGeminiModelAction(c.Param("action"))
+	if !parseOK || method != "" {
+		writeAPIError(c, http.StatusNotFound, "model not found", "not_found")
+		return
+	}
+	body, canonical, ok := s.bodyWithValidatedModel(c, spec, []byte(`{}`), model, nil)
+	if !ok {
+		return
+	}
+	_ = body
+	if !stringSliceContainsFold(clientCatalogModelsForAPIKey(s.manifest, spec), model) && !stringSliceContainsFold(clientCatalogModelsForAPIKey(s.manifest, spec), canonical) {
+		writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model %s not found", model), "not_found")
+		return
+	}
+	c.JSON(http.StatusOK, buildGeminiModelEntry(canonical))
+}
+
+func (s *relayServer) handleGeminiAction(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	model, method, parseOK := parseGeminiModelAction(c.Param("action"))
+	if !parseOK || method == "" {
+		writeAPIError(c, http.StatusNotFound, "endpoint not supported", "not_found")
+		return
+	}
+	body, err := readAndRestoreBody(c.Request)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
+		return
+	}
+	forceStream := method == "streamGenerateContent"
+	var streamPtr *bool
+	if forceStream {
+		streamPtr = &forceStream
+	}
+	body, _, ok = s.bodyWithValidatedModel(c, spec, body, model, streamPtr)
+	if !ok {
+		return
+	}
+	switch method {
+	case "generateContent", "streamGenerateContent":
+		s.handleExecutorBody(c, spec, body, sdktranslator.FormatGemini, "")
+	case "countTokens":
+		s.handleTokenCountBody(c, body, sdktranslator.FormatGemini)
+	default:
+		writeAPIError(c, http.StatusNotFound, "endpoint not supported", "not_found")
+	}
 }
 
 func (s *relayServer) handleImagesGenerations(c *gin.Context) {
@@ -2964,6 +3167,14 @@ func (s *relayServer) handleExecutorRequest(c *gin.Context, sourceFormat sdktran
 		writeAPIError(c, http.StatusBadRequest, "request body is required", "invalid_request")
 		return
 	}
+	s.handleExecutorBody(c, spec, body, sourceFormat, fixedAlt)
+}
+
+func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body []byte, sourceFormat sdktranslator.Format, fixedAlt string) {
+	if spec == nil {
+		writeAPIError(c, http.StatusUnauthorized, "missing or invalid API key", "invalid_api_key")
+		return
+	}
 	model := requestBodyModel(body)
 	if model == "" {
 		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
@@ -3030,13 +3241,23 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 			})
 		}
 	}
-	upstreamBody := rewriteProviderGatewayBodyModel(body, upstreamModel)
 	upstreamPath := "/v1/responses"
+	upstreamBody := rewriteProviderGatewayBodyModel(body, upstreamModel)
 	if wireAPI == "chat_completions" {
-		upstreamBody = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(upstreamModel, body, stream)
+		switch {
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse):
+			upstreamBody = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(upstreamModel, body, stream)
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI):
+			upstreamBody = rewriteProviderGatewayBodyModel(body, upstreamModel)
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatClaude), sourceFormatEqual(sourceFormat, sdktranslator.FormatGemini):
+			upstreamBody = sdktranslator.TranslateRequest(sourceFormat, sdktranslator.FormatOpenAI, upstreamModel, body, stream)
+		default:
+			writeAPIError(c, http.StatusBadRequest, "provider gateway does not support this request format", "invalid_request")
+			return
+		}
 		upstreamPath = "/v1/chat/completions"
 	} else if !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
-		writeAPIError(c, http.StatusBadRequest, "provider gateway only accepts responses requests", "invalid_request")
+		writeAPIError(c, http.StatusBadRequest, "provider gateway responses wire API only accepts responses requests", "invalid_request")
 		return
 	}
 
@@ -3076,7 +3297,22 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 
 	if stream {
 		if wireAPI == "chat_completions" {
-			s.writeProviderGatewayChatStream(c, resp.Body, upstreamModel, body, upstreamBody)
+			switch {
+			case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse):
+				s.writeProviderGatewayChatStream(c, resp.Body, upstreamModel, body, upstreamBody)
+			case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI):
+				c.Status(http.StatusOK)
+				c.Stream(func(w io.Writer) bool {
+					_, _ = io.Copy(w, resp.Body)
+					return false
+				})
+			default:
+				alt := fixedAlt
+				if alt == "" {
+					alt = requestAlt(c)
+				}
+				s.writeProviderGatewayTranslatedChatStream(c, resp.Body, upstreamModel, body, upstreamBody, sourceFormat, alt)
+			}
 			return
 		}
 		c.Status(http.StatusOK)
@@ -3093,10 +3329,16 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 		return
 	}
 	if wireAPI == "chat_completions" {
-		payload = responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(relayContext(c), upstreamModel, body, upstreamBody, payload, nil)
+		switch {
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse):
+			payload = responsesconverter.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(relayContext(c), upstreamModel, body, upstreamBody, payload, nil)
+		case sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI):
+		default:
+			payload = sdktranslator.TranslateNonStream(relayContext(c), sdktranslator.FormatOpenAI, sourceFormat, upstreamModel, body, upstreamBody, payload, nil)
+		}
 	}
 	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" || wireAPI == "chat_completions" {
+	if contentType == "" || (wireAPI == "chat_completions" && !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAI)) {
 		contentType = "application/json"
 	}
 	c.Data(http.StatusOK, contentType, payload)
@@ -3211,6 +3453,45 @@ func (s *relayServer) writeProviderGatewayChatStream(c *gin.Context, body io.Rea
 			providerGatewayFormatEventCounts(eventCounts),
 		),
 	)
+}
+
+func (s *relayServer) writeProviderGatewayTranslatedChatStream(c *gin.Context, body io.Reader, model string, originalBody []byte, chatBody []byte, targetFormat sdktranslator.Format, alt string) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Status(http.StatusOK)
+
+	var state any
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		outputs := sdktranslator.TranslateStream(relayContext(c), sdktranslator.FormatOpenAI, targetFormat, model, originalBody, chatBody, line, &state)
+		for _, output := range outputs {
+			if len(bytes.TrimSpace(output)) == 0 {
+				continue
+			}
+			if sourceFormatEqual(targetFormat, sdktranslator.FormatGemini) && alt == "" {
+				output = frameOpenAIStreamChunk(output)
+			}
+			if _, err := c.Writer.Write(output); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		writeStreamTerminalError(c, err)
+		flusher.Flush()
+	}
 }
 
 func providerGatewaySSEFrame(event []byte) []byte {
@@ -3597,6 +3878,971 @@ func requestBodyStream(body []byte) bool {
 	return stream
 }
 
+func (s *relayServer) bodyWithValidatedModel(c *gin.Context, spec *apiKeySpec, body []byte, model string, stream *bool) ([]byte, string, bool) {
+	body, err := injectRequestBodyModelAndStream(body, model, stream)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, err.Error(), "invalid_request")
+		return nil, "", false
+	}
+	nextBody, requestedModel, err := rewriteBodyModel(s.manifest, spec, body)
+	if requestedModel != "" && c != nil && c.Request != nil {
+		ctx := context.WithValue(c.Request.Context(), requestModelContextKey, requestedModel)
+		c.Request = c.Request.WithContext(ctx)
+	}
+	if err != nil {
+		writeAPIError(c, http.StatusNotFound, err.Error(), "model_not_available")
+		return nil, "", false
+	}
+	if nextBody != nil {
+		body = nextBody
+	}
+	canonical := requestBodyModel(body)
+	if canonical == "" {
+		canonical = strings.TrimSpace(model)
+	}
+	return body, canonical, true
+}
+
+func injectRequestBodyModelAndStream(body []byte, model string, stream *bool) ([]byte, error) {
+	var payload map[string]any
+	if len(bytes.TrimSpace(body)) == 0 {
+		payload = map[string]any{}
+	} else if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("request body must be a JSON object")
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if trimmed := strings.TrimSpace(model); trimmed != "" {
+		payload["model"] = trimmed
+	}
+	if stream != nil {
+		payload["stream"] = *stream
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *relayServer) handleTokenCount(c *gin.Context, targetFormat sdktranslator.Format, model string) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	body, err := readAndRestoreBody(c.Request)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		writeAPIError(c, http.StatusBadRequest, "request body is required", "invalid_request")
+		return
+	}
+	if strings.TrimSpace(model) == "" {
+		model = requestBodyModel(body)
+	}
+	if strings.TrimSpace(model) == "" {
+		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
+		return
+	}
+	body, _, ok = s.bodyWithValidatedModel(c, spec, body, model, nil)
+	if !ok {
+		return
+	}
+	s.handleTokenCountBody(c, body, targetFormat)
+}
+
+func (s *relayServer) handleTokenCountBody(c *gin.Context, body []byte, targetFormat sdktranslator.Format) {
+	count := estimateRequestTokens(body)
+	payload := sdktranslator.TranslateTokenCount(relayContext(c), sdktranslator.FormatCodex, targetFormat, count, body)
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+func estimateRequestTokens(body []byte) int64 {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 1
+	}
+	chars := estimateTextChars(payload)
+	if chars <= 0 {
+		chars = len(body)
+	}
+	count := int64(chars / 4)
+	if count < 1 {
+		count = 1
+	}
+	return count
+}
+
+func estimateTextChars(value any) int {
+	switch v := value.(type) {
+	case string:
+		return len([]rune(v))
+	case []any:
+		total := 0
+		for _, child := range v {
+			total += estimateTextChars(child)
+		}
+		return total
+	case map[string]any:
+		total := 0
+		for key, child := range v {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "text", "content", "system", "prompt":
+				total += estimateTextChars(child)
+			default:
+				if _, ok := child.(map[string]any); ok {
+					total += estimateTextChars(child)
+				} else if _, ok := child.([]any); ok {
+					total += estimateTextChars(child)
+				}
+			}
+		}
+		return total
+	default:
+		return 0
+	}
+}
+
+func parseGeminiModelAction(action string) (string, string, bool) {
+	raw := strings.Trim(strings.TrimPrefix(strings.TrimSpace(action), "/"), "/")
+	if raw == "" {
+		return "", "", false
+	}
+	index := strings.LastIndex(raw, ":")
+	if index < 0 {
+		return normalizeGeminiModelPath(raw), "", true
+	}
+	model := normalizeGeminiModelPath(raw[:index])
+	method := strings.TrimSpace(raw[index+1:])
+	return model, method, model != "" && method != ""
+}
+
+func normalizeGeminiModelPath(model string) string {
+	model = strings.Trim(strings.TrimSpace(model), "/")
+	model = strings.TrimPrefix(model, "models/")
+	if index := strings.LastIndex(model, "/models/"); index >= 0 {
+		model = model[index+len("/models/"):]
+	}
+	return strings.TrimSpace(model)
+}
+
+func stringSliceContainsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(target)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *relayServer) handleOllamaVersion(c *gin.Context) {
+	if _, ok := s.requireAPIKey(c); !ok {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"version": ollamaBridgeVersion})
+}
+
+func (s *relayServer) handleOllamaTags(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, buildOllamaTagsResponse(clientCatalogModelsForAPIKey(s.manifest, spec), time.Now()))
+}
+
+func (s *relayServer) handleOllamaShow(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	body, err := readAndRestoreBody(c.Request)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
+		return
+	}
+	model := requestBodyModel(body)
+	if model == "" {
+		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
+		return
+	}
+	_, canonical, ok := s.bodyWithValidatedModel(c, spec, body, model, nil)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, buildOllamaShowResponse(canonical, time.Now()))
+}
+
+func (s *relayServer) handleOllamaChat(c *gin.Context) {
+	spec, ok := s.requireAPIKey(c)
+	if !ok {
+		return
+	}
+	body, err := readAndRestoreBody(c.Request)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, "failed to read request body", "invalid_request")
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		writeAPIError(c, http.StatusBadRequest, "request body is required", "invalid_request")
+		return
+	}
+	model := requestBodyModel(body)
+	if model == "" {
+		writeAPIError(c, http.StatusBadRequest, "model is required", "invalid_request")
+		return
+	}
+	body, canonical, ok := s.bodyWithValidatedModel(c, spec, body, model, nil)
+	if !ok {
+		return
+	}
+	openAIBody, stream, err := buildOpenAIChatRequestFromOllama(body)
+	if err != nil {
+		writeAPIError(c, http.StatusBadRequest, err.Error(), "invalid_request")
+		return
+	}
+	if spec.ProviderGateway != nil {
+		s.handleOllamaProviderGatewayChat(c, spec.ProviderGateway, openAIBody, canonical, stream)
+		return
+	}
+	if stream {
+		s.handleOllamaRuntimeStream(c, openAIBody, canonical)
+		return
+	}
+	s.handleOllamaRuntimeNonStream(c, openAIBody, canonical)
+}
+
+func buildOpenAIChatRequestFromOllama(body []byte) ([]byte, bool, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false, fmt.Errorf("request body must be a JSON object")
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		return nil, false, fmt.Errorf("model is required")
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return nil, false, fmt.Errorf("messages is required")
+	}
+	stream := true
+	if value, ok := payload["stream"].(bool); ok {
+		stream = value
+	}
+	out := map[string]any{
+		"model":    strings.TrimSpace(model),
+		"messages": ollamaMessagesToOpenAI(messages),
+		"stream":   stream,
+	}
+	if tools, ok := payload["tools"].([]any); ok && len(tools) > 0 {
+		out["tools"] = tools
+	}
+	if options, ok := payload["options"].(map[string]any); ok {
+		if value, ok := options["temperature"].(float64); ok {
+			out["temperature"] = value
+		}
+		if value, ok := options["top_p"].(float64); ok {
+			out["top_p"] = value
+		}
+		if value, ok := options["num_predict"].(float64); ok {
+			out["max_tokens"] = int64(value)
+		}
+	}
+	if effort := ollamaThinkingEffort(payload["think"]); effort != "" {
+		out["reasoning_effort"] = effort
+	}
+	if responseFormat := ollamaResponseFormat(payload["format"]); responseFormat != nil {
+		out["response_format"] = responseFormat
+	}
+	raw, err := json.Marshal(out)
+	return raw, stream, err
+}
+
+func ollamaMessagesToOpenAI(messages []any) []any {
+	out := make([]any, 0, len(messages))
+	toolCallIDByName := map[string]string{}
+	for index, raw := range messages {
+		message, _ := raw.(map[string]any)
+		role, _ := message["role"].(string)
+		switch role {
+		case "assistant":
+			item := map[string]any{
+				"role":    "assistant",
+				"content": ollamaMessageContentToOpenAI(message),
+			}
+			if toolCalls, ok := message["tool_calls"].([]any); ok && len(toolCalls) > 0 {
+				item["tool_calls"] = ollamaToolCallsToOpenAI(toolCalls, index, toolCallIDByName)
+			}
+			out = append(out, item)
+		case "tool":
+			toolName, _ := message["tool_name"].(string)
+			if toolName == "" {
+				toolName, _ = message["name"].(string)
+			}
+			toolCallID, _ := message["tool_call_id"].(string)
+			if toolCallID == "" {
+				toolCallID = toolCallIDByName[toolName]
+			}
+			if toolCallID == "" {
+				toolCallID = fmt.Sprintf("tool_%d", index)
+			}
+			out = append(out, map[string]any{
+				"role":         "tool",
+				"tool_call_id": toolCallID,
+				"content":      ollamaContentString(message["content"]),
+			})
+		default:
+			if role != "system" {
+				role = "user"
+			}
+			out = append(out, map[string]any{
+				"role":    role,
+				"content": ollamaMessageContentToOpenAI(message),
+			})
+		}
+	}
+	return out
+}
+
+func ollamaToolCallsToOpenAI(toolCalls []any, messageIndex int, toolCallIDByName map[string]string) []any {
+	out := make([]any, 0, len(toolCalls))
+	for index, raw := range toolCalls {
+		toolCall, _ := raw.(map[string]any)
+		fn, _ := toolCall["function"].(map[string]any)
+		id, _ := toolCall["id"].(string)
+		if id == "" {
+			id = fmt.Sprintf("tool_%d_%d", messageIndex, index)
+		}
+		name, _ := fn["name"].(string)
+		if name == "" {
+			name = "tool"
+		}
+		toolCallIDByName[name] = id
+		out = append(out, map[string]any{
+			"id":   id,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": ollamaArgumentsString(fn["arguments"]),
+			},
+		})
+	}
+	return out
+}
+
+func ollamaMessageContentToOpenAI(message map[string]any) any {
+	text := ollamaContentString(message["content"])
+	images, _ := message["images"].([]any)
+	if len(images) == 0 {
+		return text
+	}
+	parts := make([]any, 0, len(images)+1)
+	if text != "" {
+		parts = append(parts, map[string]any{"type": "text", "text": text})
+	}
+	for _, image := range images {
+		url, _ := image.(string)
+		url = strings.TrimSpace(url)
+		if url == "" {
+			continue
+		}
+		if !strings.HasPrefix(url, "data:") && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			url = "data:image/png;base64," + url
+		}
+		parts = append(parts, map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": url},
+		})
+	}
+	return parts
+}
+
+func ollamaContentString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	default:
+		if value == nil {
+			return ""
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	}
+}
+
+func ollamaArgumentsString(value any) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	if value == nil {
+		return "{}"
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func ollamaThinkingEffort(value any) string {
+	switch v := value.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "low", "medium", "high", "xhigh":
+			return strings.ToLower(strings.TrimSpace(v))
+		case "true":
+			return "medium"
+		default:
+			return ""
+		}
+	case bool:
+		if v {
+			return "medium"
+		}
+	}
+	return ""
+}
+
+func ollamaResponseFormat(value any) map[string]any {
+	switch v := value.(type) {
+	case string:
+		if strings.EqualFold(strings.TrimSpace(v), "json") {
+			return map[string]any{"type": "json_object"}
+		}
+	case map[string]any:
+		return map[string]any{
+			"type": "json_schema",
+			"json_schema": map[string]any{
+				"name":   "ollama_schema",
+				"schema": v,
+				"strict": true,
+			},
+		}
+	}
+	return nil
+}
+
+func (s *relayServer) handleOllamaRuntimeNonStream(c *gin.Context, body []byte, model string) {
+	req, opts := buildExecutorRequest(c, body, model, sdktranslator.FormatOpenAI, "", false)
+	resp, err := s.runtime.Execute(relayContext(c), []string{"codex"}, req, opts)
+	if err != nil {
+		writeExecutorError(c, err)
+		return
+	}
+	payload := convertOpenAIChatResponseToOllama(resp.Payload, model)
+	writeUpstreamHeaders(c.Writer.Header(), resp.Headers)
+	c.Data(http.StatusOK, "application/json", payload)
+}
+
+func (s *relayServer) handleOllamaRuntimeStream(c *gin.Context, body []byte, model string) {
+	req, opts := buildExecutorRequest(c, body, model, sdktranslator.FormatOpenAI, "", true)
+	startedAt := time.Now()
+	timeouts := s.streamTimeoutsForRequest(c.Request, body, model)
+	streamCtx, cancelStream := context.WithCancel(relayContext(c))
+	defer cancelStream()
+	result, err := s.executeStreamWithOpenTimeout(c, streamCtx, []string{"codex"}, req, opts, model, startedAt, timeouts.open)
+	if err != nil {
+		writeExecutorError(c, err)
+		return
+	}
+	if result == nil || result.Chunks == nil {
+		writeAPIError(c, http.StatusBadGateway, "upstream stream is unavailable", "bad_gateway")
+		return
+	}
+	s.forwardOllamaRuntimeStream(c, streamCtx, result, model, timeouts.idle)
+}
+
+func (s *relayServer) forwardOllamaRuntimeStream(c *gin.Context, ctx context.Context, result *cliproxyexecutor.StreamResult, model string, idleTimeout time.Duration) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+		return
+	}
+	c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	writeUpstreamHeaders(c.Writer.Header(), result.Headers)
+	c.Status(http.StatusOK)
+
+	state := newOllamaStreamState(model)
+	if idleTimeout <= 0 {
+		idleTimeout = streamIdleTimeout
+	}
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+	for {
+		select {
+		case <-idleTimer.C:
+			writeOllamaErrorLine(c.Writer, relayTimeoutError{phase: "stream_idle", timeout: idleTimeout})
+			flusher.Flush()
+			return
+		case <-ctx.Done():
+			writeOllamaErrorLine(c.Writer, ctx.Err())
+			flusher.Flush()
+			return
+		case <-c.Request.Context().Done():
+			return
+		case chunk, ok := <-result.Chunks:
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleTimeout)
+			if !ok {
+				writeOllamaJSONLine(c.Writer, state.finalChunk())
+				flusher.Flush()
+				return
+			}
+			if chunk.Err != nil {
+				writeOllamaErrorLine(c.Writer, chunk.Err)
+				flusher.Flush()
+				return
+			}
+			for _, payload := range openAIStreamPayloadsFromChunk(chunk.Payload) {
+				for _, event := range state.applyOpenAIChunk(payload) {
+					writeOllamaJSONLine(c.Writer, event)
+				}
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *relayServer) handleOllamaProviderGatewayChat(c *gin.Context, gateway *providerGatewaySpec, body []byte, model string, stream bool) {
+	if gateway == nil {
+		writeAPIError(c, http.StatusBadGateway, "provider gateway is not configured", "bad_gateway")
+		return
+	}
+	if normalizeProviderGatewayWireAPI(gateway.WireAPI) != "chat_completions" {
+		writeAPIError(c, http.StatusBadRequest, "Ollama bridge requires provider gateway wire API chat_completions", "invalid_request")
+		return
+	}
+	upstreamModel := providerGatewayCanonicalModel(gateway, model)
+	if strings.TrimSpace(upstreamModel) == "" {
+		writeAPIError(c, http.StatusNotFound, fmt.Sprintf("model %s is not available for this provider gateway", model), "model_not_available")
+		return
+	}
+	if providerGatewayRequestHasVisionInput(body) && !providerGatewayModelSupportsVision(gateway, upstreamModel) {
+		writeAPIError(c, http.StatusBadRequest, fmt.Sprintf("model %s does not support image input", upstreamModel), "unsupported_image_input")
+		return
+	}
+	upstreamBody := rewriteProviderGatewayBodyModel(body, upstreamModel)
+	upstreamURL, err := providerGatewayURL(gateway.BaseURL, "/v1/chat/completions")
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	req, err := http.NewRequestWithContext(relayContext(c), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+gateway.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(resp.Body)
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		c.Data(resp.StatusCode, contentType, payload)
+		return
+	}
+	if stream {
+		s.forwardOllamaProviderGatewayStream(c, resp.Body, upstreamModel, resp.Header)
+		return
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
+		return
+	}
+	writeUpstreamHeaders(c.Writer.Header(), resp.Header)
+	c.Data(http.StatusOK, "application/json", convertOpenAIChatResponseToOllama(payload, upstreamModel))
+}
+
+func (s *relayServer) forwardOllamaProviderGatewayStream(c *gin.Context, body io.Reader, model string, headers http.Header) {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		writeAPIError(c, http.StatusInternalServerError, "streaming not supported", "streaming_not_supported")
+		return
+	}
+	c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	writeUpstreamHeaders(c.Writer.Header(), headers)
+	c.Status(http.StatusOK)
+
+	state := newOllamaStreamState(model)
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		for _, payload := range openAIStreamPayloadsFromChunk(scanner.Bytes()) {
+			for _, event := range state.applyOpenAIChunk(payload) {
+				writeOllamaJSONLine(c.Writer, event)
+			}
+		}
+		flusher.Flush()
+	}
+	if err := scanner.Err(); err != nil {
+		writeOllamaErrorLine(c.Writer, err)
+		flusher.Flush()
+		return
+	}
+	writeOllamaJSONLine(c.Writer, state.finalChunk())
+	flusher.Flush()
+}
+
+type ollamaToolCallAccumulator struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+type ollamaStreamState struct {
+	model            string
+	content          string
+	thinking         string
+	promptTokens     int64
+	completionTokens int64
+	doneReason       string
+	toolCalls        map[int]*ollamaToolCallAccumulator
+}
+
+func newOllamaStreamState(model string) *ollamaStreamState {
+	return &ollamaStreamState{
+		model:      model,
+		doneReason: "stop",
+		toolCalls:  map[int]*ollamaToolCallAccumulator{},
+	}
+}
+
+func (s *ollamaStreamState) applyOpenAIChunk(payload []byte) []gin.H {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return nil
+	}
+	if usage, ok := root["usage"].(map[string]any); ok {
+		if value, ok := numericInt64(usage["prompt_tokens"]); ok {
+			s.promptTokens = value
+		}
+		if value, ok := numericInt64(usage["completion_tokens"]); ok {
+			s.completionTokens = value
+		}
+	}
+	choices, _ := root["choices"].([]any)
+	if len(choices) == 0 {
+		return nil
+	}
+	choice, _ := choices[0].(map[string]any)
+	if reason, _ := choice["finish_reason"].(string); reason != "" {
+		s.doneReason = mapOpenAIFinishReasonToOllama(reason)
+	}
+	delta, _ := choice["delta"].(map[string]any)
+	events := []gin.H{}
+	if thinking, _ := delta["reasoning_content"].(string); thinking != "" {
+		s.thinking += thinking
+		events = append(events, gin.H{
+			"model":      s.model,
+			"created_at": time.Now().Format(time.RFC3339Nano),
+			"message":    gin.H{"role": "assistant", "content": "", "thinking": thinking},
+			"done":       false,
+		})
+	}
+	if content, _ := delta["content"].(string); content != "" {
+		s.content += content
+		events = append(events, gin.H{
+			"model":      s.model,
+			"created_at": time.Now().Format(time.RFC3339Nano),
+			"message":    gin.H{"role": "assistant", "content": content},
+			"done":       false,
+		})
+	}
+	if toolCalls, ok := delta["tool_calls"].([]any); ok {
+		s.applyToolCallDeltas(toolCalls)
+	}
+	return events
+}
+
+func (s *ollamaStreamState) applyToolCallDeltas(toolCalls []any) {
+	for _, raw := range toolCalls {
+		item, _ := raw.(map[string]any)
+		index := 0
+		if value, ok := numericInt64(item["index"]); ok {
+			index = int(value)
+		}
+		acc := s.toolCalls[index]
+		if acc == nil {
+			acc = &ollamaToolCallAccumulator{ID: fmt.Sprintf("tool_%d", index), Name: "tool"}
+			s.toolCalls[index] = acc
+		}
+		if id, _ := item["id"].(string); id != "" {
+			acc.ID = id
+		}
+		fn, _ := item["function"].(map[string]any)
+		if name, _ := fn["name"].(string); name != "" {
+			acc.Name = name
+		}
+		if arguments, _ := fn["arguments"].(string); arguments != "" {
+			acc.Arguments += arguments
+		}
+	}
+}
+
+func (s *ollamaStreamState) finalChunk() gin.H {
+	message := gin.H{
+		"role":    "assistant",
+		"content": s.content,
+	}
+	if s.thinking != "" {
+		message["thinking"] = s.thinking
+	}
+	if toolCalls := s.ollamaToolCalls(); len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
+	return gin.H{
+		"model":                s.model,
+		"created_at":           time.Now().Format(time.RFC3339Nano),
+		"message":              message,
+		"done":                 true,
+		"done_reason":          s.doneReason,
+		"total_duration":       0,
+		"load_duration":        0,
+		"prompt_eval_count":    s.promptTokens,
+		"prompt_eval_duration": 0,
+		"eval_count":           s.completionTokens,
+		"eval_duration":        0,
+	}
+}
+
+func (s *ollamaStreamState) ollamaToolCalls() []gin.H {
+	if len(s.toolCalls) == 0 {
+		return nil
+	}
+	indexes := make([]int, 0, len(s.toolCalls))
+	for index := range s.toolCalls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	out := make([]gin.H, 0, len(indexes))
+	for _, index := range indexes {
+		acc := s.toolCalls[index]
+		if acc == nil {
+			continue
+		}
+		out = append(out, gin.H{
+			"id":   acc.ID,
+			"type": "function",
+			"function": gin.H{
+				"name":      acc.Name,
+				"arguments": parseOllamaToolArguments(acc.Arguments),
+			},
+		})
+	}
+	return out
+}
+
+func convertOpenAIChatResponseToOllama(payload []byte, fallbackModel string) []byte {
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return payload
+	}
+	model, _ := root["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		model = fallbackModel
+	}
+	createdSeconds := time.Now().Unix()
+	if value, ok := numericInt64(root["created"]); ok && value > 0 {
+		createdSeconds = value
+	}
+	choice := firstOpenAIChoice(root)
+	message, _ := choice["message"].(map[string]any)
+	usage, _ := root["usage"].(map[string]any)
+	promptTokens, _ := numericInt64(usage["prompt_tokens"])
+	completionTokens, _ := numericInt64(usage["completion_tokens"])
+	outMessage := gin.H{
+		"role":    "assistant",
+		"content": stringFieldFromAny(message["content"]),
+	}
+	if thinking := stringFieldFromAny(message["reasoning_content"]); thinking != "" {
+		outMessage["thinking"] = thinking
+	}
+	if toolCalls, ok := message["tool_calls"].([]any); ok && len(toolCalls) > 0 {
+		outMessage["tool_calls"] = openAIToolCallsToOllama(toolCalls)
+	}
+	out := gin.H{
+		"model":                model,
+		"created_at":           time.Unix(createdSeconds, 0).Format(time.RFC3339Nano),
+		"message":              outMessage,
+		"done":                 true,
+		"done_reason":          mapOpenAIFinishReasonToOllama(stringFieldFromAny(choice["finish_reason"])),
+		"total_duration":       0,
+		"load_duration":        0,
+		"prompt_eval_count":    promptTokens,
+		"prompt_eval_duration": 0,
+		"eval_count":           completionTokens,
+		"eval_duration":        0,
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return payload
+	}
+	return raw
+}
+
+func firstOpenAIChoice(root map[string]any) map[string]any {
+	choices, _ := root["choices"].([]any)
+	if len(choices) == 0 {
+		return map[string]any{}
+	}
+	choice, _ := choices[0].(map[string]any)
+	if choice == nil {
+		return map[string]any{}
+	}
+	return choice
+}
+
+func openAIToolCallsToOllama(toolCalls []any) []gin.H {
+	out := make([]gin.H, 0, len(toolCalls))
+	for index, raw := range toolCalls {
+		item, _ := raw.(map[string]any)
+		fn, _ := item["function"].(map[string]any)
+		id := stringFieldFromAny(item["id"])
+		if id == "" {
+			id = fmt.Sprintf("tool_%d", index)
+		}
+		name := stringFieldFromAny(fn["name"])
+		if name == "" {
+			name = "tool"
+		}
+		out = append(out, gin.H{
+			"id":   id,
+			"type": "function",
+			"function": gin.H{
+				"name":      name,
+				"arguments": parseOllamaToolArguments(stringFieldFromAny(fn["arguments"])),
+			},
+		})
+	}
+	return out
+}
+
+func parseOllamaToolArguments(raw string) any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return gin.H{}
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+		return parsed
+	}
+	return raw
+}
+
+func openAIStreamPayloadsFromChunk(chunk []byte) [][]byte {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	var payloads [][]byte
+	for _, line := range bytes.Split(trimmed, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			payload := bytes.TrimSpace(line[len("data:"):])
+			if len(payload) > 0 {
+				payloads = append(payloads, append([]byte(nil), payload...))
+			}
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("event:")) || bytes.HasPrefix(line, []byte(":")) {
+			continue
+		}
+		payloads = append(payloads, append([]byte(nil), line...))
+	}
+	return payloads
+}
+
+func writeOllamaJSONLine(w io.Writer, value any) {
+	if w == nil {
+		return
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	_, _ = w.Write(raw)
+	_, _ = w.Write([]byte("\n"))
+}
+
+func writeOllamaErrorLine(w io.Writer, err error) {
+	writeOllamaJSONLine(w, gin.H{"error": errorMessage(err)})
+}
+
+func mapOpenAIFinishReasonToOllama(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "length":
+		return "length"
+	case "tool_calls", "function_call":
+		return "tool_calls"
+	default:
+		return "stop"
+	}
+}
+
+func numericInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	case json.Number:
+		n, err := v.Int64()
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func stringFieldFromAny(value any) string {
+	if value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return s
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
 type streamTimeoutProfile struct {
 	open time.Duration
 	idle time.Duration
@@ -3938,7 +5184,7 @@ func newRelayStreamFramer(sourceFormat sdktranslator.Format, path string) *relay
 	switch sourceFormat {
 	case sdktranslator.FormatOpenAIResponse:
 		mode = relayStreamFrameResponses
-	case sdktranslator.FormatOpenAI:
+	case sdktranslator.FormatOpenAI, sdktranslator.FormatGemini:
 		mode = relayStreamFrameOpenAI
 	}
 	if strings.HasPrefix(strings.Split(path, "?")[0], "/v1/responses") {

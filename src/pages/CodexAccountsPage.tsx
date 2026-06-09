@@ -1073,7 +1073,6 @@ export function CodexAccountsPage() {
     handleRefresh,
     handleRefreshAll,
     handleDelete,
-    handleBatchDelete,
     deleteConfirm,
     deleteConfirmError,
     deleteConfirmErrorScrollKey,
@@ -1106,6 +1105,7 @@ export function CodexAccountsPage() {
     normalizeTag,
     saveJsonFile,
   } = page;
+  const [isAllFilteredSelected, setIsAllFilteredSelected] = useState(false);
 
   const reauthTargetEmail = reauthTargetAccount?.email?.trim() ?? "";
   const [batchImportOpen, setBatchImportOpen] = useState(false);
@@ -1126,6 +1126,10 @@ export function CodexAccountsPage() {
   const [batchImportError, setBatchImportError] = useState<string | null>(null);
   const [batchImportResult, setBatchImportResult] =
     useState<codexService.CodexBatchImportConfirmResult | null>(null);
+  const [batchImportFilePaths, setBatchImportFilePaths] = useState<string[]>(
+    [],
+  );
+  const [batchImportCheckQuota, setBatchImportCheckQuota] = useState(false);
   const batchImportUnlistenersRef = useRef<UnlistenFn[]>([]);
   const batchImportSessionIdRef = useRef<string | null>(null);
 
@@ -1154,6 +1158,8 @@ export function CodexAccountsPage() {
     setBatchImportBusy(false);
     setBatchImportError(null);
     setBatchImportResult(null);
+    setBatchImportFilePaths([]);
+    setBatchImportCheckQuota(false);
   }, [cleanupBatchImportListeners]);
 
   const batchImportCounts = useMemo(() => {
@@ -1195,6 +1201,10 @@ export function CodexAccountsPage() {
   )
     .replace("{{count}}", String(batchImportSelectedSelectableCount))
     .replace("{{total}}", String(batchImportSelectableIds.length));
+  const activeBatchImportCheckQuota =
+    batchImportProgress?.checkQuota ??
+    batchImportPreview?.checkQuota ??
+    batchImportCheckQuota;
 
   const openCodexAddModal = useCallback(
     (tab: string, targetAccount?: CodexAccount | null) => {
@@ -3796,28 +3806,25 @@ export function CodexAccountsPage() {
     }
   };
 
-  const handleImportFromFiles = async () => {
-    try {
-      const selected = await openFileDialog({
-        multiple: true,
-        filters: [{ name: "JSON", extensions: ["json"] }],
-      });
-      if (!selected || (Array.isArray(selected) && selected.length === 0))
-        return;
-      const paths = Array.isArray(selected) ? selected : [selected];
-      cleanupBatchImportListeners();
-      closeAddModal();
-      setBatchImportOpen(true);
-      setBatchImportSessionId(null);
-      setBatchImportProgress(null);
-      setBatchImportPreview(null);
-      setBatchImportSelectedIds([]);
-      setBatchImportFilter("all");
-      setBatchImportResult(null);
-      setBatchImportError(null);
-      setBatchImportBusy(true);
-      batchImportSessionIdRef.current = "__pending__";
+  const startBatchImportFromPaths = async (
+    paths: string[],
+    checkQuota: boolean,
+  ) => {
+    cleanupBatchImportListeners();
+    setBatchImportOpen(true);
+    setBatchImportSessionId(null);
+    setBatchImportProgress(null);
+    setBatchImportPreview(null);
+    setBatchImportSelectedIds([]);
+    setBatchImportFilter("all");
+    setBatchImportResult(null);
+    setBatchImportError(null);
+    setBatchImportFilePaths(paths);
+    setBatchImportCheckQuota(checkQuota);
+    setBatchImportBusy(true);
+    batchImportSessionIdRef.current = "__pending__";
 
+    try {
       const progressUnlisten =
         await listen<codexService.CodexBatchImportProgress>(
           "codex:batch-import-progress",
@@ -3826,6 +3833,7 @@ export function CodexAccountsPage() {
               return;
             }
             setBatchImportProgress(event.payload);
+            setBatchImportCheckQuota(event.payload.checkQuota);
           },
         );
       const completedUnlisten =
@@ -3836,11 +3844,13 @@ export function CodexAccountsPage() {
               return;
             }
             setBatchImportPreview(event.payload);
+            setBatchImportCheckQuota(event.payload.checkQuota);
             setBatchImportProgress((current) =>
               current
                 ? {
                     ...current,
                     phase: event.payload.status,
+                    checkQuota: event.payload.checkQuota,
                     current: event.payload.items.length,
                     total: event.payload.total,
                   }
@@ -3870,6 +3880,7 @@ export function CodexAccountsPage() {
               return;
             }
             setBatchImportPreview(event.payload);
+            setBatchImportCheckQuota(event.payload.checkQuota);
             setBatchImportSelectedIds((prev) => {
               const next = new Set(prev);
               for (const item of event.payload.items) {
@@ -3891,7 +3902,10 @@ export function CodexAccountsPage() {
         completedUnlisten,
       ];
 
-      const started = await codexService.startCodexBatchImportFromFiles(paths);
+      const started = await codexService.startCodexBatchImportFromFiles(
+        paths,
+        checkQuota,
+      );
       batchImportSessionIdRef.current = started.sessionId;
       setBatchImportSessionId(started.sessionId);
     } catch (e) {
@@ -3900,6 +3914,38 @@ export function CodexAccountsPage() {
       setBatchImportBusy(false);
       setBatchImportError(String(e).replace(/^Error:\s*/, ""));
     }
+  };
+
+  const handleImportFromFiles = async () => {
+    try {
+      const selected = await openFileDialog({
+        multiple: true,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected || (Array.isArray(selected) && selected.length === 0))
+        return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      closeAddModal();
+      await startBatchImportFromPaths(paths, false);
+    } catch (e) {
+      setBatchImportBusy(false);
+      setBatchImportError(String(e).replace(/^Error:\s*/, ""));
+    }
+  };
+
+  const handleBatchImportCheckQuotaChange = async (checkQuota: boolean) => {
+    if (
+      batchImportBusy ||
+      batchImportResult ||
+      checkQuota === batchImportCheckQuota
+    ) {
+      return;
+    }
+    setBatchImportCheckQuota(checkQuota);
+    if (batchImportFilePaths.length === 0) {
+      return;
+    }
+    await startBatchImportFromPaths(batchImportFilePaths, checkQuota);
   };
 
   const handleCancelBatchImport = async () => {
@@ -6961,6 +7007,24 @@ export function CodexAccountsPage() {
     () => filteredAccounts.map((account) => account.id),
     [filteredAccounts],
   );
+  const errorAccountIds = useMemo(
+    () =>
+      filteredAccounts
+        .filter((account) => account.quota_error)
+        .map((account) => account.id),
+    [filteredAccounts],
+  );
+  const handleClearErrorAccounts = useCallback(() => {
+    if (errorAccountIds.length === 0) return;
+    setDeleteConfirm({
+      ids: errorAccountIds,
+      message: t("messages.cleanErrorAccountsConfirm", {
+        count: errorAccountIds.length,
+        defaultValue:
+          "确定要删除当前范围内的 {{count}} 条 ERROR 账号吗？",
+      }),
+    });
+  }, [errorAccountIds, setDeleteConfirm, t]);
   const exportSelectionCount = getScopedSelectedCount(filteredIds);
   const pagination = usePagination({
     items: filteredAccounts,
@@ -7062,6 +7126,71 @@ export function CodexAccountsPage() {
     () => isEveryIdSelected(selected, paginatedIds),
     [paginatedIds, selected],
   );
+  const isAllFilteredSelectionActive = useMemo(
+    () =>
+      isAllFilteredSelected &&
+      filteredIds.length > 0 &&
+      selected.size === filteredIds.length &&
+      filteredIds.every((id) => selected.has(id)),
+    [filteredIds, isAllFilteredSelected, selected],
+  );
+  const canSelectAllFilteredAccounts =
+    !isAllFilteredSelectionActive &&
+    isAllPaginatedSelected &&
+    filteredIds.length > paginatedIds.length;
+
+  useEffect(() => {
+    if (isAllFilteredSelected && !isAllFilteredSelectionActive) {
+      setIsAllFilteredSelected(false);
+    }
+  }, [isAllFilteredSelected, isAllFilteredSelectionActive]);
+
+  const handleToggleOverviewAccount = useCallback(
+    (accountId: string) => {
+      setIsAllFilteredSelected(false);
+      toggleSelect(accountId);
+    },
+    [toggleSelect],
+  );
+
+  const handleToggleSelectAllPaginated = useCallback(() => {
+    setIsAllFilteredSelected(false);
+    toggleSelectAll(paginatedIds);
+  }, [paginatedIds, toggleSelectAll]);
+
+  const handleSelectAllFilteredAccounts = useCallback(() => {
+    if (filteredIds.length === 0) return;
+    setSelected(new Set(filteredIds));
+    setIsAllFilteredSelected(true);
+  }, [filteredIds, setSelected]);
+
+  const handleClearOverviewSelection = useCallback(() => {
+    setSelected(new Set());
+    setIsAllFilteredSelected(false);
+  }, [setSelected]);
+
+  const handleCodexBatchDelete = useCallback(() => {
+    const ids = isAllFilteredSelectionActive
+      ? filteredIds
+      : Array.from(selected);
+    if (ids.length === 0) return;
+    setDeleteConfirm({
+      ids,
+      message: isAllFilteredSelectionActive
+        ? t("messages.deleteFilteredAccountsConfirm", {
+            count: ids.length,
+            defaultValue:
+              "将删除当前筛选条件下的 {{count}} 个 Codex 账号。此操作不会只删除当前页，确认继续？",
+          })
+        : t("messages.batchDeleteConfirm", { count: ids.length }),
+    });
+  }, [
+    filteredIds,
+    isAllFilteredSelectionActive,
+    selected,
+    setDeleteConfirm,
+    t,
+  ]);
 
   const groupedAccounts = useMemo(() => {
     if (!groupByTag) return [] as Array<[string, typeof filteredAccounts]>;
@@ -7255,7 +7384,7 @@ export function CodexAccountsPage() {
             <input
               type="checkbox"
               checked={isSelected}
-              onChange={() => toggleSelect(account.id)}
+              onChange={() => handleToggleOverviewAccount(account.id)}
             />
           </div>
           <span
@@ -7445,7 +7574,7 @@ export function CodexAccountsPage() {
               <input
                 type="checkbox"
                 checked={isSelected}
-                onChange={() => toggleSelect(account.id)}
+                onChange={() => handleToggleOverviewAccount(account.id)}
               />
             </div>
             {isEditingApiKeyName ? (
@@ -8742,7 +8871,7 @@ export function CodexAccountsPage() {
             <input
               type="checkbox"
               checked={selected.has(account.id)}
-              onChange={() => toggleSelect(account.id)}
+              onChange={() => handleToggleOverviewAccount(account.id)}
             />
           </td>
           <td>
@@ -9229,8 +9358,7 @@ export function CodexAccountsPage() {
   const hasGroupEntryCards = Boolean(
     inlineFolderCards && inlineFolderCards.length > 0,
   );
-  const showOverviewSelectionBar =
-    !groupByTag && !activeGroupId && paginatedAccounts.length > 0;
+  const showOverviewSelectionBar = paginatedAccounts.length > 0;
   const externalImportRunning = [
     "receiving",
     "fetching",
@@ -9890,19 +10018,29 @@ export function CodexAccountsPage() {
                   {batchImportResult
                     ? t("codex.batchImport.resultSubtitle", "导入结果")
                     : batchImportBusy
-                      ? t(
-                          "codex.batchImport.scanSubtitle",
-                          "正在逐条解析并检查账号",
-                        )
+                      ? activeBatchImportCheckQuota
+                        ? t(
+                            "codex.batchImport.scanSubtitle",
+                            "正在逐条解析并检查账号",
+                          )
+                        : t(
+                            "codex.batchImport.parseSubtitle",
+                            "正在解析账号文件",
+                          )
                       : batchImportPreview
                         ? t(
                             "codex.batchImport.previewSubtitle",
                             "选择要写入的账号",
                           )
-                        : t(
-                            "codex.batchImport.scanSubtitle",
-                            "正在逐条解析并检查账号",
-                          )}
+                        : activeBatchImportCheckQuota
+                          ? t(
+                              "codex.batchImport.scanSubtitle",
+                              "正在逐条解析并检查账号",
+                            )
+                          : t(
+                              "codex.batchImport.parseSubtitle",
+                              "正在解析账号文件",
+                            )}
                 </p>
               </div>
               <button
@@ -9928,12 +10066,18 @@ export function CodexAccountsPage() {
                       {batchImportProgress?.phase === "cancelling"
                         ? t("codex.batchImport.cancelling", "正在取消...")
                         : batchImportBusy
-                          ? t("codex.batchImport.scanning", "扫描中")
+                          ? activeBatchImportCheckQuota
+                            ? t("codex.batchImport.scanning", "扫描中")
+                            : t("codex.batchImport.parsing", "解析中")
                           : batchImportPreview?.status === "cancelled"
                             ? t("codex.batchImport.cancelled", "已取消")
                             : batchImportPreview
-                              ? t("codex.batchImport.scanDone", "扫描完成")
-                              : t("codex.batchImport.scanning", "扫描中")}
+                              ? activeBatchImportCheckQuota
+                                ? t("codex.batchImport.scanDone", "扫描完成")
+                                : t("codex.batchImport.parseDone", "解析完成")
+                              : activeBatchImportCheckQuota
+                                ? t("codex.batchImport.scanning", "扫描中")
+                                : t("codex.batchImport.parsing", "解析中")}
                     </span>
                     <strong>
                       {batchImportProgress?.current ?? 0}/
@@ -10028,7 +10172,25 @@ export function CodexAccountsPage() {
                   </div>
 
                   <div className="codex-batch-import-toolbar">
-                    <span>{batchImportSelectedCountLabel}</span>
+                    <div className="codex-batch-import-toolbar-main">
+                      <span>{batchImportSelectedCountLabel}</span>
+                      <label className="codex-batch-import-check-toggle">
+                        <input
+                          type="checkbox"
+                          checked={batchImportCheckQuota}
+                          disabled={batchImportBusy}
+                          onChange={(event) =>
+                            void handleBatchImportCheckQuotaChange(
+                              event.target.checked,
+                            )
+                          }
+                        />
+                        <span className="codex-batch-import-check-switch" />
+                        <span>
+                          {t("codex.batchImport.checkQuotaToggle", "检测账号")}
+                        </span>
+                      </label>
+                    </div>
                     <div className="codex-batch-import-actions">
                       <button
                         type="button"
@@ -10100,7 +10262,15 @@ export function CodexAccountsPage() {
                               {item.provider && <span>{item.provider}</span>}
                               {item.status === "ready" && (
                                 <span>
-                                  {t("codex.batchImport.quotaOk", "账号正常")}
+                                  {activeBatchImportCheckQuota
+                                    ? t(
+                                        "codex.batchImport.quotaOk",
+                                        "账号正常",
+                                      )
+                                    : t(
+                                        "codex.batchImport.groups.ready",
+                                        "可导入",
+                                      )}
                                 </span>
                               )}
                               {item.status === "quota_failed" && (
@@ -10167,7 +10337,9 @@ export function CodexAccountsPage() {
                     }
                   >
                     {batchImportBusy
-                      ? t("codex.batchImport.cancelScan", "取消扫描")
+                      ? activeBatchImportCheckQuota
+                        ? t("codex.batchImport.cancelScan", "取消扫描")
+                        : t("codex.batchImport.cancelParse", "取消解析")
                       : t("common.shared.close", "关闭")}
                   </button>
                   {!batchImportBusy &&
@@ -10177,7 +10349,9 @@ export function CodexAccountsPage() {
                         onClick={() => void handleResumeBatchImport()}
                       >
                         <RefreshCw size={16} />
-                        {t("codex.batchImport.resumeScan", "继续扫描")}
+                        {activeBatchImportCheckQuota
+                          ? t("codex.batchImport.resumeScan", "继续扫描")
+                          : t("codex.batchImport.resumeParse", "继续解析")}
                       </button>
                     )}
                   <button
@@ -10399,24 +10573,14 @@ export function CodexAccountsPage() {
                 {t("accounts.groups.addAccounts")}
               </button>
               {selected.size > 0 && (
-                <>
-                  <button
-                    className="btn btn-secondary breadcrumb-remove-btn"
-                    onClick={() => setShowAddToCodexGroupModal(true)}
-                    title={t("accounts.groups.moveToGroup")}
-                  >
-                    <FolderPlus size={14} />
-                    {t("accounts.groups.moveToGroup")} ({selected.size})
-                  </button>
-                  <button
-                    className="btn btn-secondary breadcrumb-remove-btn"
-                    onClick={() => void handleRemoveFromGroup()}
-                    title={t("accounts.groups.removeFromGroup")}
-                  >
-                    <LogOut size={14} />
-                    {t("accounts.groups.removeFromGroup")} ({selected.size})
-                  </button>
-                </>
+                <button
+                  className="btn btn-secondary breadcrumb-remove-btn"
+                  onClick={() => void handleRemoveFromGroup()}
+                  title={t("accounts.groups.removeFromGroup")}
+                >
+                  <LogOut size={14} />
+                  {t("accounts.groups.removeFromGroup")} ({selected.size})
+                </button>
               )}
             </div>
           )}
@@ -10652,28 +10816,6 @@ export function CodexAccountsPage() {
               >
                 <Upload size={14} />
               </button>
-              {selected.size > 0 && (
-                <>
-                  <button
-                    className="btn btn-secondary icon-only"
-                    onClick={() => setShowAddToCodexGroupModal(true)}
-                    title={
-                      activeGroupId
-                        ? t("accounts.groups.moveToGroup")
-                        : t("codex.groups.addToGroup", "添加至分组")
-                    }
-                  >
-                    <FolderPlus size={14} />
-                  </button>
-                  <button
-                    className="btn btn-danger icon-only"
-                    onClick={handleBatchDelete}
-                    title={`${t("common.delete", "删除")} (${selected.size})`}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </>
-              )}
               {!activeGroupId && (
                 <button
                   className={`btn btn-secondary icon-only ${groupFilter.length > 0 ? "btn-filter-active" : ""}`}
@@ -10747,14 +10889,88 @@ export function CodexAccountsPage() {
             <>
               {showOverviewSelectionBar && (
                 <div className="codex-overview-selection-bar">
-                  <label className="codex-overview-select-all">
-                    <input
-                      type="checkbox"
-                      checked={isAllPaginatedSelected}
-                      onChange={() => toggleSelectAll(paginatedIds)}
-                    />
-                    <span>{t("common.selectAll", "全选")}</span>
-                  </label>
+                  <div className="codex-overview-selection-left">
+                    <label className="codex-overview-select-all">
+                      <input
+                        type="checkbox"
+                        checked={isAllPaginatedSelected}
+                        onChange={handleToggleSelectAllPaginated}
+                      />
+                      <span>{t("common.selectAll", "全选")}</span>
+                    </label>
+                    {selected.size > 0 && !isAllFilteredSelectionActive && (
+                      <span className="codex-overview-selected-count">
+                        {t(
+                          "codex.apiService.customRoutingSelected",
+                          "已选 {{count}}",
+                        ).replace("{{count}}", String(selected.size))}
+                      </span>
+                    )}
+                    {canSelectAllFilteredAccounts && (
+                      <button
+                        type="button"
+                        className="codex-overview-select-filtered-btn"
+                        onClick={handleSelectAllFilteredAccounts}
+                      >
+                        {t("messages.selectAllFilteredAccounts", {
+                          count: filteredIds.length,
+                          defaultValue: "选择全部符合条件 {{count}} 条",
+                        })}
+                      </button>
+                    )}
+                    {isAllFilteredSelectionActive && (
+                      <>
+                        <span className="codex-overview-selected-count">
+                          {t("messages.selectedAllFilteredAccounts", {
+                            count: filteredIds.length,
+                            defaultValue: "已选择全部符合条件 {{count}} 条",
+                          })}
+                        </span>
+                        <button
+                          type="button"
+                          className="codex-overview-clear-selection-btn"
+                          onClick={handleClearOverviewSelection}
+                        >
+                          {t("messages.clearSelection", "取消选择")}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                  {(selected.size > 0 || errorAccountIds.length > 0) && (
+                    <div className="codex-overview-selection-actions">
+                      {errorAccountIds.length > 0 && (
+                        <button
+                          className="btn btn-danger icon-only codex-overview-clear-error-btn"
+                          onClick={handleClearErrorAccounts}
+                          title={`${t("messages.cleanErrorAccountsAction", "清理 ERROR 账号")} (${errorAccountIds.length})`}
+                        >
+                          <CircleAlert size={14} />
+                        </button>
+                      )}
+                      {selected.size > 0 && (
+                        <>
+                          <button
+                            className="btn btn-secondary icon-only"
+                            onClick={() => setShowAddToCodexGroupModal(true)}
+                            title={
+                              activeGroupId
+                                ? `${t("accounts.groups.moveToGroup")} (${selected.size})`
+                                : `${t("codex.groups.addToGroup", "添加至分组")} (${selected.size})`
+                            }
+                          >
+                            <FolderPlus size={14} />
+                          </button>
+                          <button
+                            className="btn btn-danger icon-only"
+                            onClick={handleCodexBatchDelete}
+                            title={`${t("common.delete", "删除")} (${selected.size})`}
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
               {overviewLayoutMode === "compact" ? (
@@ -10811,7 +11027,7 @@ export function CodexAccountsPage() {
                           <input
                             type="checkbox"
                             checked={isAllPaginatedSelected}
-                            onChange={() => toggleSelectAll(paginatedIds)}
+                            onChange={handleToggleSelectAllPaginated}
                           />
                           {t("common.selectAll", "全选")}
                         </label>
@@ -10863,11 +11079,13 @@ export function CodexAccountsPage() {
                       <thead>
                         <tr>
                           <th style={{ width: 40 }}>
-                            <input
-                              type="checkbox"
-                              checked={isAllPaginatedSelected}
-                              onChange={() => toggleSelectAll(paginatedIds)}
-                            />
+                            {showOverviewSelectionBar ? null : (
+                              <input
+                                type="checkbox"
+                                checked={isAllPaginatedSelected}
+                                onChange={handleToggleSelectAllPaginated}
+                              />
+                            )}
                           </th>
                           <th style={{ width: 260 }}>
                             {t("common.shared.columns.email", "账号")}
@@ -10924,7 +11142,7 @@ export function CodexAccountsPage() {
                               <input
                                 type="checkbox"
                                 checked={isAllPaginatedSelected}
-                                onChange={() => toggleSelectAll(paginatedIds)}
+                                onChange={handleToggleSelectAllPaginated}
                               />
                             )}
                           </th>

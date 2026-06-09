@@ -393,6 +393,7 @@ Every bit of support helps sustain open-source development. Thank you!
 
 - Antigravity account switching logic references: [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)
 - Codex API service references and integrates: [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+- Codex API service protocol compatibility direction references: [codex-proxy](https://github.com/icebear0828/codex-proxy)
 - Codex third-party provider presets reference: [CC Switch](https://github.com/farion1231/cc-switch)
 - Codex model catalog and frontend model display ideas reference: [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)
 
