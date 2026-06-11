@@ -38,6 +38,7 @@ export interface CodexProviderCapabilityProfile {
 const CHAT_COMPLETIONS_PRESET_IDS = new Set([
   "deepseek",
   "moonshot",
+  "kimi_coding",
   "siliconflow",
   "siliconflow_en",
   "zhipu_glm",
@@ -67,6 +68,26 @@ const CHAT_COMPLETIONS_PRESET_IDS = new Set([
   "openrouter",
 ]);
 
+const CHAT_COMPLETIONS_PROVIDER_HOSTS = [
+  "api.kimi.com",
+];
+
+function isChatCompletionsProviderBaseUrl(baseUrl: string): boolean {
+  const normalized = baseUrl.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized.includes("/chat/completions")) {
+    return true;
+  }
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    return CHAT_COMPLETIONS_PROVIDER_HOSTS.some((pattern) =>
+      host.includes(pattern),
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function resolveCodexProviderCapabilityProfile(input: {
   presetId?: string | null;
   baseUrl: string;
@@ -74,7 +95,9 @@ export function resolveCodexProviderCapabilityProfile(input: {
 }): CodexProviderCapabilityProfile {
   const presetId =
     input.presetId?.trim() || resolveCodexApiProviderPresetId(input.baseUrl);
-  const inferredChatCompletions = CHAT_COMPLETIONS_PRESET_IDS.has(presetId);
+  const inferredChatCompletions =
+    CHAT_COMPLETIONS_PRESET_IDS.has(presetId) ||
+    isChatCompletionsProviderBaseUrl(input.baseUrl);
   const wireApi =
     input.wireApi ?? (inferredChatCompletions ? "chat_completions" : "responses");
 

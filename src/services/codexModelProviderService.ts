@@ -190,6 +190,11 @@ function presetModelCatalogForBaseUrl(baseUrl: string): string[] | undefined {
   );
 }
 
+function presetSupportsVisionForBaseUrl(baseUrl: string): boolean | undefined {
+  return findCodexApiProviderPresetById(resolveCodexApiProviderPresetId(baseUrl))
+    ?.supportsVision;
+}
+
 export function normalizeCodexModelProviderBaseUrl(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -281,7 +286,10 @@ function toValidProviderList(raw: unknown): CodexModelProvider[] {
       modelCatalog:
         normalizeModelCatalog((item as { modelCatalog?: unknown }).modelCatalog) ??
         presetModelCatalogForBaseUrl(baseUrl),
-      supportsVision: (item as { supportsVision?: unknown }).supportsVision === true,
+      supportsVision:
+        typeof (item as { supportsVision?: unknown }).supportsVision === 'boolean'
+          ? (item as { supportsVision?: boolean }).supportsVision === true
+          : presetSupportsVisionForBaseUrl(baseUrl) === true,
       modelCapabilities: normalizeModelCapabilities(
         (item as { modelCapabilities?: unknown }).modelCapabilities,
       ),
@@ -433,7 +441,8 @@ export async function createCodexModelProvider(input: {
     modelCatalog:
       normalizeModelCatalog(input.modelCatalog) ??
       presetModelCatalogForBaseUrl(baseUrl),
-    supportsVision: input.supportsVision === true,
+    supportsVision:
+      input.supportsVision ?? presetSupportsVisionForBaseUrl(baseUrl) ?? false,
     modelCapabilities: normalizeModelCapabilities(input.modelCapabilities),
     visionRoutingModel: sanitizeName(input.visionRoutingModel ?? '') || undefined,
     boundInstanceId: normalizeBoundInstanceId(input.boundInstanceId),

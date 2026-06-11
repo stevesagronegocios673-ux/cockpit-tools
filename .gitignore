@@ -49,3 +49,12 @@ target/
 docs/plugin-architecture-proposal.md
 .aitasks
 .qoder/
+
+# Codex temporary files
+.codex-tmp/
+
+# Local planning docs
+docs/superpowers/plans/
+
+# Built binaries
+sidecars/cockpit-cliproxy/cockpit-cliproxy

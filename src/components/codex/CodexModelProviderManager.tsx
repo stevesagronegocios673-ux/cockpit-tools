@@ -888,7 +888,7 @@ export function CodexModelProviderManager({
         name: preset.name,
         baseUrl: preset.baseUrls[0] ?? "",
         modelCatalogText: (preset.modelCatalog ?? []).join("\n"),
-        supportsVision: false,
+        supportsVision: preset.supportsVision === true,
         visionModelText: "",
         visionRoutingModel: "",
         website: preset.website ?? "",
