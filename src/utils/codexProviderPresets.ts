@@ -294,14 +294,14 @@ export const CODEX_API_PROVIDER_PRESETS: readonly CodexApiProviderPreset[] = [
     id: "xiaomi_mimo",
     name: "Xiaomi MiMo",
     baseUrls: ["https://api.xiaomimimo.com/v1"],
-    modelCatalog: ["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro", "mimo-k1.5"],
+    modelCatalog: ["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro"],
     website: "https://www.xiaomimimo.com/",
   },
   {
     id: "xiaomi_mimo_token_plan",
     name: "Xiaomi MiMo Token Plan",
     baseUrls: ["https://token-plan-cn.xiaomimimo.com/v1"],
-    modelCatalog: ["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro", "mimo-k1.5"],
+    modelCatalog: ["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro"],
     website: "https://www.xiaomimimo.com/",
   },
   {

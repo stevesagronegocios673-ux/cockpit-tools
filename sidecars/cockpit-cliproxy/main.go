@@ -3758,11 +3758,13 @@ func ensureKimiAssistantReasoningContent(body []byte) []byte {
 }
 
 func providerGatewayKimiHostname() string {
-	hostname, err := os.Hostname()
-	if err != nil || strings.TrimSpace(hostname) == "" {
-		return "unknown"
+	raw, err := os.Hostname()
+	if err != nil || strings.TrimSpace(raw) == "" {
+		raw = "unknown"
 	}
-	return hostname
+	// 脱敏：不向 Kimi 上游发送真实主机名，改为确定性短哈希
+	sum := sha256.Sum256([]byte(raw))
+	return fmt.Sprintf("device-%x", sum[:6])
 }
 
 func providerGatewayKimiDeviceModel() string {

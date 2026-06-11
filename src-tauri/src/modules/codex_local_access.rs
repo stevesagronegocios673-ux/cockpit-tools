@@ -10502,7 +10502,7 @@ fn provider_gateway_models_for_account(account: &CodexAccount) -> Vec<String> {
         return normalize_provider_gateway_models(vec!["k2p6"]);
     }
     if provider_id == "xiaomi_mimo" || provider_id == "xiaomi_mimo_token_plan" || base_url.contains("xiaomimimo.com") {
-        return normalize_provider_gateway_models(vec!["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro", "mimo-k1.5"]);
+        return normalize_provider_gateway_models(vec!["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro"]);
     }
     if provider_id == "zhipu_glm"
         || provider_id == "zhipu_glm_en"
@@ -19697,8 +19697,8 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
             label: "Provider Gateway: disabled".to_string(),
             key: "disabled-key".to_string(),
             provider_gateway: Some(CodexLocalAccessProviderGateway {
-                upstream_model: "mimo-k1.5".to_string(),
-                upstream_models: vec!["mimo-k1.5".to_string()],
+                upstream_model: "mimo-v2.5-pro".to_string(),
+                upstream_models: vec!["mimo-v2.5-pro".to_string()],
                 ..gateway
             }),
             account_ids: vec!["mimo-account".to_string()],
@@ -19727,7 +19727,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
         };
         let models = visible_codex_model_ids_for_api_key(&collection, &main_key, None);
         assert!(models.iter().any(|model| model == "k2p6"));
-        assert!(!models.iter().any(|model| model == "mimo-k1.5"));
+        assert!(!models.iter().any(|model| model == "mimo-v2.5-pro"));
         assert!(validate_client_model_visible(
             "k2p6", "k2p6", &collection, &main_key, None,
         ));

@@ -1231,8 +1231,8 @@ func TestResolveGatewayForModelMixedPool(t *testing.T) {
 	gatewayDisabled := &providerGatewaySpec{
 		BaseURL:        "https://api.xiaomimimo.com/v1",
 		APIKey:         "mimo",
-		UpstreamModel:  "mimo-k1.5",
-		UpstreamModels: []string{"mimo-k1.5"},
+		UpstreamModel:  "mimo-v2.5-pro",
+		UpstreamModels: []string{"mimo-v2.5-pro"},
 		WireAPI:        "chat_completions",
 	}
 	m := &manifest{
@@ -1263,7 +1263,7 @@ func TestResolveGatewayForModelMixedPool(t *testing.T) {
 		t.Fatalf("expected round-robin across gateway candidates, got: %v", seenKeys)
 	}
 	// 禁用条目不参与路由
-	if gateway := resolveGatewayForModel(m, mainSpec, "mimo-k1.5"); gateway != nil {
+	if gateway := resolveGatewayForModel(m, mainSpec, "mimo-v2.5-pro"); gateway != nil {
 		t.Fatalf("disabled gateway entry should not route: %+v", gateway)
 	}
 	// 网关密钥自身不做二次分流
@@ -1287,8 +1287,8 @@ func TestVisibleModelsForAPIKeyIncludesGatewayModelsForPoolKeys(t *testing.T) {
 				UpstreamModels: []string{"k2p6"},
 			}},
 			{ID: "pg_off", Key: "key-off", Enabled: false, ProviderGateway: &providerGatewaySpec{
-				UpstreamModel:  "mimo-k1.5",
-				UpstreamModels: []string{"mimo-k1.5"},
+				UpstreamModel:  "mimo-v2.5-pro",
+				UpstreamModels: []string{"mimo-v2.5-pro"},
 			}},
 		},
 	}
@@ -1298,7 +1298,7 @@ func TestVisibleModelsForAPIKeyIncludesGatewayModelsForPoolKeys(t *testing.T) {
 	if !strings.Contains(joined, "gpt-5.5") || !strings.Contains(joined, "k2p6") {
 		t.Fatalf("pool key should see pool and gateway models: %#v", models)
 	}
-	if strings.Contains(joined, "mimo-k1.5") {
+	if strings.Contains(joined, "mimo-v2.5-pro") {
 		t.Fatalf("disabled gateway entry models should stay hidden: %#v", models)
 	}
 
