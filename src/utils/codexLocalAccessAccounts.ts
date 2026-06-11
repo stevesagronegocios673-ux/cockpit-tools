@@ -3,10 +3,12 @@ import {
   isCodexExplicitFreePlanType,
   type CodexAccount,
 } from '../types/codex';
+import type { CodexLocalAccessCollection } from '../types/codexLocalAccess';
 
 const CHAT_COMPLETIONS_PROVIDER_HOSTS = [
   "api.deepseek.com",
   "api.moonshot.cn",
+  "api.kimi.com",
   "api.siliconflow.cn",
   "api.siliconflow.com",
   "open.bigmodel.cn",
@@ -42,6 +44,8 @@ export type CodexLocalAccessAccountIneligibleReason =
   | "chat_completions_api_key"
   | "free_restricted";
 
+export type CodexLocalAccessAccountSupportMode = "pool" | "provider_gateway";
+
 export function isCodexChatCompletionsApiKeyAccount(account: CodexAccount): boolean {
   if (!isCodexApiKeyAccount(account)) {
     return false;
@@ -74,23 +78,65 @@ export function getCodexLocalAccessAccountIneligibleReason(
   account: CodexAccount,
   restrictFreeAccounts: boolean,
 ): CodexLocalAccessAccountIneligibleReason | null {
-  if (isCodexChatCompletionsApiKeyAccount(account)) {
-    return "chat_completions_api_key";
-  }
   if (restrictFreeAccounts && isCodexExplicitFreePlanType(account.plan_type)) {
     return "free_restricted";
   }
+  if (isCodexChatCompletionsApiKeyAccount(account)) {
+    return "chat_completions_api_key";
+  }
   return null;
+}
+
+export function getCodexLocalAccessAccountSupportMode(
+  account: CodexAccount,
+  restrictFreeAccounts: boolean,
+): CodexLocalAccessAccountSupportMode | null {
+  if (restrictFreeAccounts && isCodexExplicitFreePlanType(account.plan_type)) {
+    return null;
+  }
+  if (isCodexChatCompletionsApiKeyAccount(account)) {
+    return "provider_gateway";
+  }
+  return "pool";
+}
+
+export function isCodexLocalAccessSelectableAccount(
+  account: CodexAccount,
+  restrictFreeAccounts: boolean,
+): boolean {
+  return (
+    getCodexLocalAccessAccountSupportMode(account, restrictFreeAccounts) !== null
+  );
 }
 
 export function isCodexLocalAccessEligibleAccount(
   account: CodexAccount,
   restrictFreeAccounts: boolean,
 ): boolean {
-  return getCodexLocalAccessAccountIneligibleReason(
-    account,
-    restrictFreeAccounts,
-  ) === null;
+  return (
+    getCodexLocalAccessAccountSupportMode(account, restrictFreeAccounts) ===
+    "pool"
+  );
+}
+
+export function getCodexLocalAccessSelectedAccountIds(
+  collection?: CodexLocalAccessCollection | null,
+): string[] {
+  const seen = new Set<string>();
+  const next: string[] = [];
+  const push = (accountId?: string | null) => {
+    const normalized = accountId?.trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    next.push(normalized);
+  };
+
+  (collection?.accountIds ?? []).forEach(push);
+  (collection?.apiKeys ?? []).forEach((apiKey) => {
+    (apiKey.accountIds ?? []).forEach(push);
+  });
+
+  return next;
 }
 
 export function filterCodexLocalAccessAccountIds(
@@ -104,7 +150,14 @@ export function filterCodexLocalAccessAccountIds(
 
   for (const accountId of accountIds) {
     const account = accountById.get(accountId);
-    if (!account || !isCodexLocalAccessEligibleAccount(account, restrictFreeAccounts)) {
+    if (!account) {
+      continue;
+    }
+    const supportMode = getCodexLocalAccessAccountSupportMode(
+      account,
+      restrictFreeAccounts,
+    );
+    if (supportMode !== "pool" && supportMode !== "provider_gateway") {
       continue;
     }
     if (!seen.has(accountId)) {

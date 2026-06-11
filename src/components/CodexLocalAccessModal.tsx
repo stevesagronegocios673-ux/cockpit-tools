@@ -53,8 +53,9 @@ import {
   type CodexQuotaPoolItem,
 } from "../utils/codexQuotaPool";
 import {
-  getCodexLocalAccessAccountIneligibleReason,
-  isCodexLocalAccessEligibleAccount,
+  getCodexLocalAccessAccountSupportMode,
+  getCodexLocalAccessSelectedAccountIds,
+  isCodexLocalAccessSelectableAccount,
 } from "../utils/codexLocalAccessAccounts";
 import { isBlockingCodexQuotaError } from "../utils/codexQuotaError";
 import { AccountTagFilterDropdown } from "./AccountTagFilterDropdown";
@@ -467,16 +468,20 @@ export function CodexLocalAccessModal({
   );
 
   const localAccessAccounts = useMemo(() => accounts, [accounts]);
+  const currentSelectedAccountIds = useMemo(
+    () => getCodexLocalAccessSelectedAccountIds(collection),
+    [collection],
+  );
   const quotaPoolSummary = useMemo(
     () => summarizeCodexQuotaPool(localAccessAccounts),
     [localAccessAccounts],
   );
   const currentQuotaPoolSummary = useMemo(() => {
-    const accountIds = new Set(collection?.accountIds ?? []);
+    const accountIds = new Set(currentSelectedAccountIds);
     return summarizeCodexQuotaPool(
       localAccessAccounts.filter((account) => accountIds.has(account.id)),
     );
-  }, [collection?.accountIds, localAccessAccounts]);
+  }, [currentSelectedAccountIds, localAccessAccounts]);
   const accountPoolHealthSummary = useMemo<AccountPoolHealthSummary>(() => {
     const accountById = new Map(
       localAccessAccounts.map((account) => [account.id, account]),
@@ -485,7 +490,7 @@ export function CodexLocalAccessModal({
       (state?.accountHealth ?? []).map((health) => [health.accountId, health]),
     );
     const summary: AccountPoolHealthSummary = {
-      total: collection?.accountIds.length ?? 0,
+      total: currentSelectedAccountIds.length,
       available: 0,
       abnormal: 0,
       cooldown: 0,
@@ -494,7 +499,7 @@ export function CodexLocalAccessModal({
       quotaLimited: 0,
     };
 
-    (collection?.accountIds ?? []).forEach((accountId) => {
+    currentSelectedAccountIds.forEach((accountId) => {
       const account = accountById.get(accountId);
       const health = healthById.get(accountId);
       if (!account) {
@@ -524,7 +529,7 @@ export function CodexLocalAccessModal({
     });
 
     return summary;
-  }, [collection?.accountIds, localAccessAccounts, state?.accountHealth]);
+  }, [currentSelectedAccountIds, localAccessAccounts, state?.accountHealth]);
   const initialRestrictFreeAccounts = collection?.restrictFreeAccounts ?? true;
   const normalizedInitialSelectedIds = useMemo(() => {
     const accountById = new Map(
@@ -533,10 +538,11 @@ export function CodexLocalAccessModal({
     return initialSelectedIds.filter((accountId) => {
       const account = accountById.get(accountId);
       if (!account) return false;
-      return isCodexLocalAccessEligibleAccount(
+      const supportMode = getCodexLocalAccessAccountSupportMode(
         account,
         initialRestrictFreeAccounts,
       );
+      return supportMode === "pool" || supportMode === "provider_gateway";
     });
   }, [initialSelectedIds, initialRestrictFreeAccounts, localAccessAccounts]);
 
@@ -878,14 +884,11 @@ export function CodexLocalAccessModal({
   const visibleSelectableAccounts = useMemo(
     () =>
       visibleAccounts.filter((account) => {
-        const ineligibleReason = getCodexLocalAccessAccountIneligibleReason(
+        const supportMode = getCodexLocalAccessAccountSupportMode(
           account,
           restrictFreeAccounts,
         );
-        if (ineligibleReason === "chat_completions_api_key") {
-          return true;
-        }
-        if (isCodexLocalAccessEligibleAccount(account, restrictFreeAccounts)) {
+        if (supportMode === "pool" || supportMode === "provider_gateway") {
           return true;
         }
         return selected.has(account.id);
@@ -914,7 +917,7 @@ export function CodexLocalAccessModal({
   const visibleEnabledAccounts = useMemo(
     () =>
       visibleSelectableAccounts.filter((account) =>
-        isCodexLocalAccessEligibleAccount(account, restrictFreeAccounts),
+        isCodexLocalAccessSelectableAccount(account, restrictFreeAccounts),
       ),
     [restrictFreeAccounts, visibleSelectableAccounts],
   );
@@ -971,8 +974,7 @@ export function CodexLocalAccessModal({
   }, [selectedStatsWindow?.accounts]);
 
   const currentMemberStats = useMemo(() => {
-    const currentIds = collection?.accountIds ?? [];
-    return currentIds
+    return currentSelectedAccountIds
       .map((accountId) => {
         const account = localAccessAccounts.find(
           (item) => item.id === accountId,
@@ -992,7 +994,7 @@ export function CodexLocalAccessModal({
         const leftCount = left.stats?.requestCount ?? 0;
         return rightCount - leftCount;
       });
-  }, [collection?.accountIds, localAccessAccounts, t, windowStatsByAccountId]);
+  }, [currentSelectedAccountIds, localAccessAccounts, t, windowStatsByAccountId]);
 
   const routingStrategyOptions = useMemo(
     () =>
@@ -1348,8 +1350,13 @@ export function CodexLocalAccessModal({
     if (actionBusy) return;
     const account = localAccessAccountById.get(accountId);
     if (!account) return;
+    const supportMode = getCodexLocalAccessAccountSupportMode(
+      account,
+      restrictFreeAccounts,
+    );
     const isSelectionBlocked =
-      !isCodexLocalAccessEligibleAccount(account, restrictFreeAccounts) &&
+      supportMode !== "pool" &&
+      supportMode !== "provider_gateway" &&
       !selected.has(accountId);
     if (isSelectionBlocked) {
       return;
@@ -1373,7 +1380,11 @@ export function CodexLocalAccessModal({
       const filtered = Array.from(selected).filter((accountId) => {
         const account = localAccessAccountById.get(accountId);
         if (!account) return false;
-        return isCodexLocalAccessEligibleAccount(account, restrictFreeAccounts);
+        const supportMode = getCodexLocalAccessAccountSupportMode(
+          account,
+          restrictFreeAccounts,
+        );
+        return supportMode === "pool" || supportMode === "provider_gateway";
       });
       await onSaveAccounts({
         accountIds: filtered,
@@ -2741,16 +2752,16 @@ export function CodexLocalAccessModal({
                         account,
                         t,
                       );
-                      const ineligibleReason =
-                        getCodexLocalAccessAccountIneligibleReason(
-                          account,
-                          restrictFreeAccounts,
-                        );
-                      const isChatCompletionsApiKeyUnsupported =
-                        ineligibleReason === "chat_completions_api_key";
-                      const isChecked =
-                        !isChatCompletionsApiKeyUnsupported &&
-                        selected.has(account.id);
+                      const supportMode = getCodexLocalAccessAccountSupportMode(
+                        account,
+                        restrictFreeAccounts,
+                      );
+                      const isSelectable = supportMode !== null;
+                      const isProviderGateway =
+                        supportMode === "provider_gateway";
+                      const isChecked = selected.has(account.id);
+                      const isSelectionBlocked =
+                        !isSelectable && !selected.has(account.id);
                       const accountStats = allStatsByAccountId.get(
                         account.id,
                       )?.usage;
@@ -2758,14 +2769,12 @@ export function CodexLocalAccessModal({
                       return (
                         <label
                           key={account.id}
-                          className={`group-account-item${isChecked ? " is-current" : ""}${isChatCompletionsApiKeyUnsupported ? " is-disabled" : ""}`}
+                          className={`group-account-item${isChecked ? " is-current" : ""}${isSelectionBlocked ? " is-disabled" : ""}`}
                         >
                           <input
                             type="checkbox"
                             checked={isChecked}
-                            disabled={
-                              actionBusy || isChatCompletionsApiKeyUnsupported
-                            }
+                            disabled={actionBusy || isSelectionBlocked}
                             onChange={() => toggleSelect(account.id)}
                           />
                           <div className="group-account-main">
@@ -2789,11 +2798,11 @@ export function CodexLocalAccessModal({
                                   defaultValue: "{{count}} 次请求",
                                 })}
                               </span>
-                              {isChatCompletionsApiKeyUnsupported && (
-                                <span className="codex-local-access-member-unsupported">
+                              {isProviderGateway && (
+                                <span className="codex-local-access-member-metric">
                                   {t(
-                                    "codex.localAccess.modal.chatApiKeyUnsupported",
-                                    "Chat Completions 协议不支持加入 API 服务",
+                                    "codex.modelProviders.enableMode.gatewayMode",
+                                    "网关模式",
                                   )}
                                 </span>
                               )}

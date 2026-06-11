@@ -96,7 +96,10 @@ import {
   type CodexApiProviderMode,
   type CodexQuotaErrorInfo,
 } from "../types/codex";
-import { filterCodexLocalAccessAccountIds } from "../utils/codexLocalAccessAccounts";
+import {
+  filterCodexLocalAccessAccountIds,
+  getCodexLocalAccessSelectedAccountIds,
+} from "../utils/codexLocalAccessAccounts";
 import { isBlockingCodexQuotaError } from "../utils/codexQuotaError";
 import { buildCodexAccountPresentation } from "../presentation/platformAccountPresentation";
 
@@ -2556,6 +2559,7 @@ export function CodexAccountsPage() {
           apiProviderId: preset.id,
           apiProviderName: preset.name,
           apiModelCatalog: preset.modelCatalog,
+          apiSupportsVision: preset.supportsVision,
           apiWireApi: resolveCodexProviderCapabilityProfile({
             presetId: preset.id,
             baseUrl: normalizedBaseUrl,
@@ -5724,17 +5728,17 @@ export function CodexAccountsPage() {
   );
 
   const localAccessAccountIdSet = useMemo(
-    () => new Set(localAccessCollection?.accountIds ?? []),
-    [localAccessCollection?.accountIds],
+    () => new Set(getCodexLocalAccessSelectedAccountIds(localAccessCollection)),
+    [localAccessCollection],
   );
   const localAccessAccounts = useMemo(
     () =>
-      (localAccessCollection?.accountIds ?? [])
+      getCodexLocalAccessSelectedAccountIds(localAccessCollection)
         .map((accountId) =>
           accounts.find((account) => account.id === accountId),
         )
         .filter((account): account is CodexAccount => Boolean(account)),
-    [accounts, localAccessCollection?.accountIds],
+    [accounts, localAccessCollection],
   );
   const localAccessQuotaPoolSummary = useMemo(
     () => summarizeCodexQuotaPool(localAccessAccounts),
@@ -5752,7 +5756,7 @@ export function CodexAccountsPage() {
         ]),
       );
       const summary: LocalAccessAccountPoolHealthSummary = {
-        total: localAccessCollection?.accountIds.length ?? 0,
+        total: getCodexLocalAccessSelectedAccountIds(localAccessCollection).length,
         available: 0,
         abnormal: 0,
         cooldown: 0,
@@ -5761,7 +5765,7 @@ export function CodexAccountsPage() {
         quotaLimited: 0,
       };
 
-      (localAccessCollection?.accountIds ?? []).forEach((accountId) => {
+      getCodexLocalAccessSelectedAccountIds(localAccessCollection).forEach((accountId) => {
         const account = accountById.get(accountId);
         const health = healthById.get(accountId);
         if (!account) {
@@ -5797,7 +5801,7 @@ export function CodexAccountsPage() {
       return summary;
     }, [
       accounts,
-      localAccessCollection?.accountIds,
+      localAccessCollection,
       localAccessState?.accountHealth,
     ]);
   const localAccessAccountPoolHealthHasIssue =
@@ -5960,8 +5964,8 @@ export function CodexAccountsPage() {
   }, [accounts, reloadLocalAccessState]);
 
   const localAccessModalSelectedIds = useMemo(
-    () => [...(localAccessCollection?.accountIds ?? [])],
-    [localAccessCollection?.accountIds],
+    () => getCodexLocalAccessSelectedAccountIds(localAccessCollection),
+    [localAccessCollection],
   );
 
   const handleSaveLocalAccessAccounts = useCallback(
@@ -6012,13 +6016,9 @@ export function CodexAccountsPage() {
     async (accountId: string) => {
       if (!localAccessCollection) return;
       try {
-        await handleSaveLocalAccessAccounts(
-          localAccessCollection.accountIds.filter((id) => id !== accountId),
-          {
-            restrictFreeAccounts:
-              localAccessCollection.restrictFreeAccounts ?? true,
-          },
-        );
+        const nextState =
+          await codexLocalAccessService.removeCodexLocalAccessAccount(accountId);
+        setLocalAccessState(nextState);
       } catch (error) {
         setMessage({
           text: t("messages.actionFailed", {
@@ -6770,7 +6770,9 @@ export function CodexAccountsPage() {
 
   const handleQuickRefreshLocalAccessQuota = useCallback(async () => {
     if (!localAccessCollection) return;
-    const targetIds = localAccessCollection.accountIds.filter((accountId) => {
+    const targetIds = getCodexLocalAccessSelectedAccountIds(
+      localAccessCollection,
+    ).filter((accountId) => {
       const account = accounts.find((item) => item.id === accountId);
       return Boolean(account && !isCodexApiKeyAccount(account));
     });

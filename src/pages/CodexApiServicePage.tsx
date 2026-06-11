@@ -76,7 +76,10 @@ import {
   formatCodexQuotaPoolPercent,
   summarizeCodexQuotaPool,
 } from "../utils/codexQuotaPool";
-import { filterCodexLocalAccessAccountIds } from "../utils/codexLocalAccessAccounts";
+import {
+  filterCodexLocalAccessAccountIds,
+  getCodexLocalAccessSelectedAccountIds,
+} from "../utils/codexLocalAccessAccounts";
 import { SingleSelectDropdown } from "../components/SingleSelectDropdown";
 import { CodexLocalAccessModal } from "../components/CodexLocalAccessModal";
 import { PaginationControls } from "../components/PaginationControls";
@@ -636,7 +639,10 @@ export function CodexApiServicePage() {
       return stats[statsRange];
     }, [stats, statsRange]);
   const totals = selectedStatsWindow?.totals;
-  const memberIds = collection?.accountIds ?? [];
+  const memberIds = useMemo(
+    () => getCodexLocalAccessSelectedAccountIds(collection),
+    [collection],
+  );
   const localAccessAccounts = useMemo(() => accounts, [accounts]);
   const memberAccounts = useMemo(
     () =>
@@ -1437,16 +1443,6 @@ export function CodexApiServicePage() {
     });
   };
 
-  const handleSaveMembers = async (
-    accountIds: string[],
-    restrictFreeAccounts: boolean,
-  ) => {
-    await runAction(
-      () => saveMembers(accountIds, restrictFreeAccounts),
-      t("codex.localAccess.saveSuccess", "API 服务集合已更新"),
-    );
-  };
-
   const handleSaveMembersFromModal = async (
     accountIds: string[],
     restrictFreeAccounts: boolean,
@@ -1468,10 +1464,10 @@ export function CodexApiServicePage() {
 
   const handleRemoveMember = async (accountId: string) => {
     if (!collection) return;
-    await handleSaveMembers(
-      collection.accountIds.filter((item) => item !== accountId),
-      collection.restrictFreeAccounts,
+    const next = await codexLocalAccessService.removeCodexLocalAccessAccount(
+      accountId,
     );
+    setState(next);
   };
 
   const handleCreateApiKey = async () => {

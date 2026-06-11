@@ -1575,21 +1575,47 @@ fn visible_codex_model_ids_for_api_key(
     health_by_account_id: Option<&HashMap<String, RuntimeAccountHealth>>,
 ) -> Vec<String> {
     let mut visible = visible_codex_model_ids_for_collection(collection, health_by_account_id);
-    if let Some(provider_gateway) = api_key.provider_gateway.as_ref() {
-        let mut seen: HashSet<String> = visible
-            .iter()
-            .map(|model| model.trim().to_ascii_lowercase())
-            .filter(|model| !model.is_empty())
-            .collect();
-        for model in &provider_gateway.upstream_models {
-            let model = model.trim();
-            if !model.is_empty() && seen.insert(model.to_ascii_lowercase()) {
-                visible.push(model.to_string());
-            }
+    let mut seen: HashSet<String> = visible
+        .iter()
+        .map(|model| model.trim().to_ascii_lowercase())
+        .filter(|model| !model.is_empty())
+        .collect();
+    let extra_models = match api_key.provider_gateway.as_ref() {
+        Some(provider_gateway) => provider_gateway.upstream_models.clone(),
+        // 混合池：非网关密钥可见集合内全部网关条目模型
+        None => collection_provider_gateway_model_union(collection),
+    };
+    for model in &extra_models {
+        let model = model.trim();
+        if !model.is_empty() && seen.insert(model.to_ascii_lowercase()) {
+            visible.push(model.to_string());
         }
     }
     let filtered = apply_model_filters(visible, &api_key.allowed_models, &api_key.excluded_models);
     append_codex_internal_model_ids(add_model_prefix(filtered, api_key.model_prefix.as_deref()))
+}
+
+/// 集合内所有 enabled 供应商网关条目的模型并集（去重，保序）
+fn collection_provider_gateway_model_union(
+    collection: &CodexLocalAccessCollection,
+) -> Vec<String> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &collection.api_keys {
+        if !entry.enabled {
+            continue;
+        }
+        let Some(gateway) = entry.provider_gateway.as_ref() else {
+            continue;
+        };
+        for model in &gateway.upstream_models {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_ascii_lowercase()) {
+                models.push(trimmed.to_string());
+            }
+        }
+    }
+    models
 }
 
 fn is_codex_internal_model(model: &str) -> bool {
@@ -6348,6 +6374,15 @@ fn remove_account_refs_from_collection(
         changed |= api_key.account_ids != before;
     }
 
+    // 供应商网关密钥与账号一一对应，账号移除后条目失去意义，直接清理
+    let before_api_keys_len = collection.api_keys.len();
+    collection.api_keys.retain(|api_key| {
+        api_key.provider_gateway.is_none()
+            || !api_key.id.starts_with("provider_gateway_")
+            || !api_key.account_ids.is_empty()
+    });
+    changed |= collection.api_keys.len() != before_api_keys_len;
+
     let before_custom_rules = collection.custom_routing_rules.clone();
     collection
         .custom_routing_rules
@@ -9024,6 +9059,10 @@ fn sanitize_collection_with_accounts(
     accounts: &[CodexAccount],
 ) -> Result<(bool, HashSet<String>), String> {
     let mut changed = false;
+    let account_by_id: HashMap<&str, &CodexAccount> = accounts
+        .iter()
+        .map(|account| (account.id.as_str(), account))
+        .collect();
 
     if collection.port == 0 {
         collection.port = allocate_initial_local_port(bind_host_for_collection(collection))?;
@@ -9112,6 +9151,25 @@ fn sanitize_collection_with_accounts(
             .retain(|account_id| valid_scope_account_ids.contains(account_id));
         if api_key.account_ids != before {
             changed = true;
+        }
+        if api_key.provider_gateway.is_some() {
+            if let Some(account) = api_key
+                .account_ids
+                .first()
+                .and_then(|account_id| account_by_id.get(account_id.as_str()))
+                .copied()
+            {
+                let next_provider_gateway = provider_gateway_for_account(account)?;
+                let next_label = format!("Provider Gateway: {}", account.email);
+                if api_key.provider_gateway.as_ref() != Some(&next_provider_gateway) {
+                    api_key.provider_gateway = Some(next_provider_gateway);
+                    changed = true;
+                }
+                if api_key.label != next_label {
+                    api_key.label = next_label;
+                    changed = true;
+                }
+            }
         }
     }
 
@@ -10257,7 +10315,33 @@ pub async fn activate_local_access_for_dir(
         .clone()
         .ok_or_else(|| "API 服务集合尚未创建".to_string())?;
     write_local_access_profile_takeover(profile_dir, &collection, None).await?;
+    sync_api_service_profile_model_catalog(profile_dir, &collection)?;
     Ok(state)
+}
+
+/// 混合池：API 服务接管时把网关条目模型并入 Codex 模型目录，
+/// 让客户端的模型选择器可以直接选择 k2p6 等池外模型；
+/// 集合内没有网关条目时清理历史目录，避免残留
+fn sync_api_service_profile_model_catalog(
+    profile_dir: &Path,
+    collection: &CodexLocalAccessCollection,
+) -> Result<(), String> {
+    let gateway_models = collection_provider_gateway_model_union(collection);
+    if gateway_models.is_empty() {
+        return cleanup_provider_gateway_profile_model_overrides(profile_dir);
+    }
+    let mut models = visible_codex_model_ids_for_collection(collection, None);
+    let mut seen: HashSet<String> = models
+        .iter()
+        .map(|model| model.trim().to_ascii_lowercase())
+        .filter(|model| !model.is_empty())
+        .collect();
+    for model in gateway_models {
+        if seen.insert(model.to_ascii_lowercase()) {
+            models.push(model);
+        }
+    }
+    write_provider_gateway_model_catalog(profile_dir, &models)
 }
 
 fn new_empty_local_access_collection() -> Result<CodexLocalAccessCollection, String> {
@@ -10414,6 +10498,12 @@ fn provider_gateway_models_for_account(account: &CodexAccount) -> Vec<String> {
     if provider_id == "moonshot" || base_url.contains("api.moonshot.cn") {
         return normalize_provider_gateway_models(vec!["kimi-k2.6"]);
     }
+    if provider_id == "kimi_coding" || base_url.contains("api.kimi.com") {
+        return normalize_provider_gateway_models(vec!["k2p6"]);
+    }
+    if provider_id == "xiaomi_mimo" || provider_id == "xiaomi_mimo_token_plan" || base_url.contains("xiaomimimo.com") {
+        return normalize_provider_gateway_models(vec!["mimo-v2.5-pro-ultraspeed", "mimo-v2.5-pro", "mimo-k1.5"]);
+    }
     if provider_id == "zhipu_glm"
         || provider_id == "zhipu_glm_en"
         || base_url.contains("open.bigmodel.cn")
@@ -10459,6 +10549,7 @@ fn provider_gateway_wire_api_for_account(account: &CodexAccount) -> String {
     let chat_hosts = [
         "api.deepseek.com",
         "api.moonshot.cn",
+        "api.kimi.com",
         "api.siliconflow.cn",
         "api.siliconflow.com",
         "open.bigmodel.cn",
@@ -12012,6 +12103,96 @@ pub async fn stream_chat_local_access_with_dialog(
     }
 }
 
+/// 按账号协议把成员选择写入集合：responses 协议进账号池，
+/// chat_completions 协议转换为带 provider_gateway 的密钥条目；
+/// 不符合条件的账号显式报错，避免静默丢弃导致集合被意外清空。
+fn apply_local_access_member_selection(
+    collection: &mut CodexLocalAccessCollection,
+    accounts: &[CodexAccount],
+    account_ids: Vec<String>,
+    restrict_free_accounts: bool,
+) -> Result<(), String> {
+    let account_by_id: HashMap<&str, &CodexAccount> = accounts
+        .iter()
+        .map(|account| (account.id.as_str(), account))
+        .collect();
+
+    let mut next_account_ids = Vec::new();
+    let mut gateway_account_ids = Vec::new();
+    let mut rejected = Vec::new();
+    let mut seen = HashSet::new();
+    for account_id in account_ids {
+        if !seen.insert(account_id.clone()) {
+            continue;
+        }
+        let Some(account) = account_by_id.get(account_id.as_str()) else {
+            rejected.push(account_id);
+            continue;
+        };
+        if is_local_access_eligible_account(account, restrict_free_accounts) {
+            next_account_ids.push(account_id);
+        } else if is_provider_gateway_eligible_account(account)
+            && !(restrict_free_accounts && is_free_plan_type(account.plan_type.as_deref()))
+        {
+            gateway_account_ids.push(account_id);
+        } else {
+            rejected.push(account.email.clone());
+        }
+    }
+    if !rejected.is_empty() {
+        return Err(format!(
+            "以下账号不符合 API 服务使用条件，本次保存已取消: {}",
+            rejected.join(", ")
+        ));
+    }
+
+    let now = now_ms();
+    let selected_gateway_ids: HashSet<String> = gateway_account_ids.iter().cloned().collect();
+    collection.api_keys.retain(|item| {
+        if item.provider_gateway.is_none() || !item.id.starts_with("provider_gateway_") {
+            return true;
+        }
+        item.account_ids
+            .iter()
+            .any(|account_id| selected_gateway_ids.contains(account_id))
+    });
+    for account_id in &gateway_account_ids {
+        let account = account_by_id[account_id.as_str()];
+        let provider_gateway = provider_gateway_for_account(account)?;
+        let entry_id = provider_gateway_api_key_id(account_id);
+        if let Some(existing) = collection
+            .api_keys
+            .iter_mut()
+            .find(|item| item.id == entry_id)
+        {
+            existing.label = format!("Provider Gateway: {}", account.email);
+            existing.provider_gateway = Some(provider_gateway);
+            existing.account_ids = vec![account_id.clone()];
+            existing.enabled = true;
+            existing.updated_at = now;
+        } else {
+            collection.api_keys.push(CodexLocalAccessApiKey {
+                id: entry_id,
+                label: format!("Provider Gateway: {}", account.email),
+                key: generate_local_api_key(),
+                provider_gateway: Some(provider_gateway),
+                account_ids: vec![account_id.clone()],
+                model_prefix: None,
+                allowed_models: Vec::new(),
+                excluded_models: Vec::new(),
+                enabled: true,
+                created_at: now,
+                updated_at: now,
+                last_used_at: None,
+            });
+        }
+    }
+
+    collection.restrict_free_accounts = restrict_free_accounts;
+    collection.account_ids = next_account_ids;
+    Ok(())
+}
+
 pub async fn save_local_access_accounts(
     account_ids: Vec<String>,
     restrict_free_accounts: bool,
@@ -12057,25 +12238,12 @@ pub async fn save_local_access_accounts(
     };
 
     let accounts = codex_account::list_accounts_checked()?;
-    let valid_account_ids: HashSet<String> = accounts
-        .iter()
-        .filter(|account| is_local_access_eligible_account(account, restrict_free_accounts))
-        .map(|account| account.id.clone())
-        .collect();
-
-    let mut next_account_ids = Vec::new();
-    let mut seen = HashSet::new();
-    for account_id in account_ids {
-        if !valid_account_ids.contains(&account_id) {
-            continue;
-        }
-        if seen.insert(account_id.clone()) {
-            next_account_ids.push(account_id);
-        }
-    }
-
-    collection.restrict_free_accounts = restrict_free_accounts;
-    collection.account_ids = next_account_ids;
+    apply_local_access_member_selection(
+        &mut collection,
+        &accounts,
+        account_ids,
+        restrict_free_accounts,
+    )?;
     collection.updated_at = now_ms();
     let (changed, _) = sanitize_collection_with_accounts(&mut collection, &accounts)?;
     if changed {
@@ -17462,8 +17630,10 @@ mod tests {
         build_local_access_api_key, build_local_models_response, build_ordered_account_ids,
         build_request_routing_hint, build_upstream_websocket_url, calculate_usage_cost_usd,
         canonical_model_for_client_model, classify_upstream_error_category,
-        cleanup_profile_takeover_without_backup, cleanup_provider_gateway_profile_model_overrides,
-        collect_local_access_profile_takeover_dirs_from_store, compare_routing_candidates,
+        apply_local_access_member_selection, cleanup_profile_takeover_without_backup,
+        cleanup_provider_gateway_profile_model_overrides,
+        collect_local_access_profile_takeover_dirs_from_store,
+        collection_provider_gateway_model_union, compare_routing_candidates,
         extract_usage_capture, inspect_local_access_profile_config,
         is_codex_local_access_auth_text, is_codex_local_access_config_for_api_key,
         is_image_generation_capability_error, is_local_access_eligible_account,
@@ -17475,20 +17645,22 @@ mod tests {
         normalized_sidecar_error_category, parse_codex_retry_after,
         parse_responses_payload_from_upstream, parse_websocket_upstream_error,
         prepare_gateway_request, profile_base_url_matches,
-        provider_gateway_default_model_for_account, provider_gateway_models_for_account,
-        read_http_request, recover_invalid_stats_file, remove_account_refs_from_collection,
-        remove_codex_local_access_config, resolve_plan_rank, resolve_supported_model_alias,
-        resolve_upstream_target, restore_config_toml_from_takeover_backup,
-        sanitize_collection_with_accounts, scutil_proxy_map,
-        should_retry_single_account_upstream_status, should_treat_response_as_stream,
-        should_try_next_account, sidecar_codex_api_key_auth_id, sidecar_config_fingerprint,
-        sidecar_stable_id, system_proxy_target_scheme, system_proxy_value_url,
-        validate_client_model_visible, visible_codex_model_ids_for_api_key, websocket_accept_value,
-        websocket_connect_error_from_http_response, windows_proxy_url_from_server,
-        windows_reg_dword_enabled, windows_reg_query_map,
+        provider_gateway_api_key_id, provider_gateway_default_model_for_account,
+        provider_gateway_models_for_account, provider_gateway_wire_api_for_account,
+        read_http_request, recover_invalid_stats_file,
+        remove_account_refs_from_collection, remove_codex_local_access_config, resolve_plan_rank,
+        resolve_supported_model_alias, resolve_upstream_target,
+        restore_config_toml_from_takeover_backup, sanitize_collection_with_accounts,
+        scutil_proxy_map, should_retry_single_account_upstream_status,
+        should_treat_response_as_stream, should_try_next_account, sidecar_codex_api_key_auth_id,
+        sidecar_config_fingerprint, sidecar_stable_id, system_proxy_target_scheme,
+        system_proxy_value_url, validate_client_model_visible, visible_codex_model_ids_for_api_key,
+        websocket_accept_value, websocket_connect_error_from_http_response,
+        windows_proxy_url_from_server, windows_reg_dword_enabled, windows_reg_query_map,
         write_local_access_profile_model_override, write_provider_gateway_model_catalog,
-        write_string_atomic, CodexLocalAccessCollection, CodexLocalAccessGatewayMode,
-        CodexLocalAccessScope, GatewayResponseAdapter, ParsedRequest, ResolvedLocalApiKey,
+        write_string_atomic, CodexLocalAccessApiKey, CodexLocalAccessCollection,
+        CodexLocalAccessGatewayMode, CodexLocalAccessScope, GatewayResponseAdapter, ParsedRequest,
+        ResolvedLocalApiKey,
         ResponseUsageCollector, RoutingCandidate, SidecarUsageDetails, SidecarUsageEvent,
         UsageCapture, CODEX_AUTO_REVIEW_MODEL_ID, CODEX_PROFILE_AUTH_FILE,
         CODEX_PROFILE_CONFIG_FILE, CODEX_PROVIDER_MODEL_BACKUP_FILE,
@@ -17775,6 +17947,120 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         assert!(provider_gateway_models_for_account(&account).is_empty());
         assert!(provider_gateway_default_model_for_account(&account).is_empty());
+    }
+
+    #[test]
+    fn provider_gateway_models_default_to_k2p6_for_kimi_coding_host() {
+        let account = CodexAccount::new_api_key(
+            "local-account-id".to_string(),
+            "kimi@example.com".to_string(),
+            "sk-test".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.kimi.com/coding/v1".to_string()),
+            Some("custom-provider".to_string()),
+            Some("Kimi Coding".to_string()),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            provider_gateway_models_for_account(&account),
+            vec!["k2p6".to_string()]
+        );
+        assert_eq!(provider_gateway_default_model_for_account(&account), "k2p6");
+    }
+
+    #[test]
+    fn provider_gateway_wire_api_infers_chat_completions_for_kimi_coding_host() {
+        let account = CodexAccount::new_api_key(
+            "local-account-id".to_string(),
+            "kimi@example.com".to_string(),
+            "sk-test".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.kimi.com/coding/v1".to_string()),
+            Some("custom-provider".to_string()),
+            Some("Kimi Coding".to_string()),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            provider_gateway_wire_api_for_account(&account),
+            "chat_completions"
+        );
+        assert!(account_requires_provider_gateway(&account));
+    }
+
+    #[test]
+    fn member_selection_converts_gateway_accounts_and_rejects_unknown() {
+        let pool_account = CodexAccount::new_api_key(
+            "pool-account".to_string(),
+            "pool@example.com".to_string(),
+            "sk-pool".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://www.packyapi.com/v1".to_string()),
+            Some("custom-provider".to_string()),
+            Some("PackyCode".to_string()),
+            Vec::new(),
+        );
+        let kimi_account = CodexAccount::new_api_key(
+            "kimi-account".to_string(),
+            "kimi@example.com".to_string(),
+            "sk-kimi".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.kimi.com/coding/v1".to_string()),
+            Some("custom-provider".to_string()),
+            Some("Kimi Coding".to_string()),
+            Vec::new(),
+        );
+        let accounts = vec![pool_account, kimi_account];
+        let mut collection = test_local_access_collection(Vec::new());
+
+        apply_local_access_member_selection(
+            &mut collection,
+            &accounts,
+            vec!["pool-account".to_string(), "kimi-account".to_string()],
+            true,
+        )
+        .expect("保存成员应成功");
+
+        assert_eq!(collection.account_ids, vec!["pool-account".to_string()]);
+        assert_eq!(collection.api_keys.len(), 1);
+        let entry = &collection.api_keys[0];
+        assert_eq!(entry.id, provider_gateway_api_key_id("kimi-account"));
+        assert_eq!(entry.account_ids, vec!["kimi-account".to_string()]);
+        let gateway = entry.provider_gateway.as_ref().expect("应生成网关配置");
+        assert_eq!(gateway.base_url, "https://api.kimi.com/coding/v1");
+        assert_eq!(gateway.wire_api.as_deref(), Some("chat_completions"));
+        let original_key = entry.key.clone();
+        assert!(!original_key.trim().is_empty());
+
+        // 重复保存时网关密钥保持稳定
+        apply_local_access_member_selection(
+            &mut collection,
+            &accounts,
+            vec!["kimi-account".to_string()],
+            true,
+        )
+        .expect("重复保存应成功");
+        assert!(collection.account_ids.is_empty());
+        assert_eq!(collection.api_keys.len(), 1);
+        assert_eq!(collection.api_keys[0].key, original_key);
+
+        // 未知账号应整体报错，且不修改集合
+        let error = apply_local_access_member_selection(
+            &mut collection,
+            &accounts,
+            vec!["missing-account".to_string()],
+            true,
+        )
+        .expect_err("未知账号应报错");
+        assert!(error.contains("missing-account"));
+        assert_eq!(collection.api_keys.len(), 1);
+
+        // 取消勾选后移除网关条目
+        apply_local_access_member_selection(&mut collection, &accounts, Vec::new(), true)
+            .expect("清空成员应成功");
+        assert!(collection.account_ids.is_empty());
+        assert!(collection.api_keys.is_empty());
     }
 
     #[test]
@@ -19380,6 +19666,74 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
     }
 
     #[test]
+    fn mixed_pool_main_key_sees_gateway_entry_models() {
+        let mut collection = test_local_access_collection(vec!["account-1".to_string()]);
+        let gateway = CodexLocalAccessProviderGateway {
+            base_url: "https://api.kimi.com/coding/v1".to_string(),
+            api_key: "sk-kimi".to_string(),
+            upstream_model: "k2p6".to_string(),
+            upstream_models: vec!["k2p6".to_string()],
+            wire_api: Some("chat_completions".to_string()),
+            supports_vision: false,
+            model_capabilities: HashMap::new(),
+            vision_routing_model: None,
+        };
+        collection.api_keys.push(CodexLocalAccessApiKey {
+            id: "provider_gateway_kimi-account".to_string(),
+            label: "Provider Gateway: kimi".to_string(),
+            key: "gateway-key".to_string(),
+            provider_gateway: Some(gateway.clone()),
+            account_ids: vec!["kimi-account".to_string()],
+            model_prefix: None,
+            allowed_models: Vec::new(),
+            excluded_models: Vec::new(),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+            last_used_at: None,
+        });
+        collection.api_keys.push(CodexLocalAccessApiKey {
+            id: "provider_gateway_disabled".to_string(),
+            label: "Provider Gateway: disabled".to_string(),
+            key: "disabled-key".to_string(),
+            provider_gateway: Some(CodexLocalAccessProviderGateway {
+                upstream_model: "mimo-k1.5".to_string(),
+                upstream_models: vec!["mimo-k1.5".to_string()],
+                ..gateway
+            }),
+            account_ids: vec!["mimo-account".to_string()],
+            model_prefix: None,
+            allowed_models: Vec::new(),
+            excluded_models: Vec::new(),
+            enabled: false,
+            created_at: 0,
+            updated_at: 0,
+            last_used_at: None,
+        });
+
+        assert_eq!(
+            collection_provider_gateway_model_union(&collection),
+            vec!["k2p6".to_string()]
+        );
+
+        let main_key = ResolvedLocalApiKey {
+            id: "main".to_string(),
+            label: "Default".to_string(),
+            provider_gateway: None,
+            account_ids: Vec::new(),
+            model_prefix: None,
+            allowed_models: Vec::new(),
+            excluded_models: Vec::new(),
+        };
+        let models = visible_codex_model_ids_for_api_key(&collection, &main_key, None);
+        assert!(models.iter().any(|model| model == "k2p6"));
+        assert!(!models.iter().any(|model| model == "mimo-k1.5"));
+        assert!(validate_client_model_visible(
+            "k2p6", "k2p6", &collection, &main_key, None,
+        ));
+    }
+
+    #[test]
     fn prepares_chat_completions_request_for_responses_proxy() {
         let request = ParsedRequest {
             method: "POST".to_string(),
@@ -20608,6 +20962,60 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
         assert!(collection.account_ids.is_empty());
         assert_eq!(collection.api_keys.len(), 1);
         assert_eq!(collection.api_keys[0].account_ids, vec![account_id]);
+    }
+
+    #[test]
+    fn sanitize_collection_refreshes_provider_gateway_snapshot_from_account() {
+        let mut account = CodexAccount::new_api_key(
+            "kimi-account".to_string(),
+            "kimi@example.com".to_string(),
+            "sk-kimi-new".to_string(),
+            CodexApiProviderMode::Custom,
+            Some("https://api.kimi.com/coding/v1".to_string()),
+            Some("kimi_coding".to_string()),
+            Some("Kimi Coding".to_string()),
+            Vec::new(),
+        );
+        account.api_wire_api = Some("chat_completions".to_string());
+        account.api_supports_vision = true;
+        account
+            .api_model_vision_support
+            .insert("k2p6".to_string(), true);
+        account.api_vision_routing_model = Some("k2p6".to_string());
+
+        let mut collection = test_local_access_collection(Vec::new());
+        let mut api_key = build_local_access_api_key(Some("Provider Gateway"));
+        api_key.provider_gateway = Some(CodexLocalAccessProviderGateway {
+            base_url: "https://api.kimi.com/coding/v1".to_string(),
+            api_key: "sk-kimi-old".to_string(),
+            upstream_model: "k2p6".to_string(),
+            upstream_models: vec!["k2p6".to_string()],
+            wire_api: Some("chat_completions".to_string()),
+            supports_vision: false,
+            model_capabilities: HashMap::new(),
+            vision_routing_model: None,
+        });
+        api_key.account_ids = vec![account.id.clone()];
+        collection.api_keys = vec![api_key];
+
+        let (changed, _) = sanitize_collection_with_accounts(&mut collection, &[account])
+            .expect("collection should sanitize");
+
+        assert!(changed, "provider gateway snapshot should refresh from account");
+        let gateway = collection.api_keys[0]
+            .provider_gateway
+            .as_ref()
+            .expect("provider gateway should remain present");
+        assert_eq!(gateway.api_key, "sk-kimi-new");
+        assert!(gateway.supports_vision);
+        assert_eq!(
+            gateway
+                .model_capabilities
+                .get("k2p6")
+                .map(|capability| capability.supports_vision),
+            Some(true)
+        );
+        assert_eq!(gateway.vision_routing_model.as_deref(), Some("k2p6"));
     }
 
     #[test]

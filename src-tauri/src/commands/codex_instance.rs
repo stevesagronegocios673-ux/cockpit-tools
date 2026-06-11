@@ -133,6 +133,19 @@ async fn inject_bound_account_to_profile(
         return Ok(());
     }
 
+    // 旧版绑定可能存的是普通账号 ID；Chat Completions 协议的账号直连会 404，
+    // 这里按账号实际协议兜底改走供应商网关
+    if let Some(account) = modules::codex_account::load_account(bind_account_id) {
+        if modules::codex_local_access::account_requires_provider_gateway(&account) {
+            modules::codex_local_access::activate_provider_gateway_for_dir(
+                profile_dir,
+                bind_account_id,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     modules::codex_local_access::cleanup_provider_gateway_profile_model_overrides(profile_dir)?;
     modules::codex_instance::inject_account_to_profile(profile_dir, bind_account_id).await
 }
@@ -144,10 +157,20 @@ async fn ensure_provider_gateway_for_bind_account(
     let Some(bind_account_id) = bind_account_id else {
         return Ok(());
     };
-    let Some(provider_gateway_account_id) =
-        modules::codex_instance::parse_provider_gateway_bind_account_id(bind_account_id)
-    else {
-        return Ok(());
+    let provider_gateway_account_id = match modules::codex_instance::parse_provider_gateway_bind_account_id(
+        bind_account_id,
+    ) {
+        Some(account_id) => account_id,
+        None => {
+            // 与注入路径保持一致：普通账号 ID 绑定的 Chat Completions 账号也要确保网关在运行
+            let Some(account) = modules::codex_account::load_account(bind_account_id) else {
+                return Ok(());
+            };
+            if !modules::codex_local_access::account_requires_provider_gateway(&account) {
+                return Ok(());
+            }
+            bind_account_id.to_string()
+        }
     };
     modules::codex_local_access::ensure_provider_gateway_for_dir(
         profile_dir,
