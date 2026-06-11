@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -644,10 +646,14 @@ func TestRelayServerProviderGatewayRoutesResponsesToChatCompletions(t *testing.T
 	gin.SetMode(gin.TestMode)
 	var upstreamPath string
 	var upstreamAuth string
+	var upstreamUserAgent string
+	var upstreamPlatform string
 	var upstreamBody string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamPath = r.URL.Path
 		upstreamAuth = r.Header.Get("Authorization")
+		upstreamUserAgent = r.Header.Get("User-Agent")
+		upstreamPlatform = r.Header.Get("X-Msh-Platform")
 		body, _ := io.ReadAll(r.Body)
 		upstreamBody = string(body)
 		w.Header().Set("Content-Type", "application/json")
@@ -712,6 +718,9 @@ func TestRelayServerProviderGatewayRoutesResponsesToChatCompletions(t *testing.T
 	if upstreamAuth != "Bearer deepseek-key" {
 		t.Fatalf("unexpected upstream auth: %s", upstreamAuth)
 	}
+	if upstreamUserAgent == "KimiCLI/1.10.6" || upstreamPlatform != "" {
+		t.Fatalf("deepseek provider gateway should not inject kimi headers: ua=%q platform=%q", upstreamUserAgent, upstreamPlatform)
+	}
 	if !strings.Contains(upstreamBody, `"messages"`) || !strings.Contains(upstreamBody, `"stream":false`) {
 		t.Fatalf("request should be converted to chat completions: %s", upstreamBody)
 	}
@@ -732,6 +741,243 @@ func TestRelayServerProviderGatewayRoutesResponsesToChatCompletions(t *testing.T
 	if !strings.Contains(modelW.Body.String(), "deepseek-v4-flash") || !strings.Contains(modelW.Body.String(), "deepseek-v4-pro") || strings.Contains(modelW.Body.String(), "gpt-5.5") {
 		t.Fatalf("provider gateway should expose DeepSeek models only: %s", modelW.Body.String())
 	}
+}
+
+func TestEnsureKimiAssistantReasoningContent(t *testing.T) {
+	body := []byte(`{"model":"k2p6","messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"t","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"ok"},
+		{"role":"assistant","tool_calls":[{"id":"call_2","type":"function","function":{"name":"t","arguments":"{}"}}],"reasoning_content":"kept"},
+		{"role":"assistant","content":"plain"}
+	]}`)
+
+	out := ensureKimiAssistantReasoningContent(body)
+	var payload struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("unmarshal patched body: %v", err)
+	}
+	// 缺失的补空串
+	if value, exists := payload.Messages[1]["reasoning_content"]; !exists || value != "" {
+		t.Fatalf("missing reasoning_content should be backfilled with empty string: %v", payload.Messages[1])
+	}
+	// 已有的保持不变
+	if payload.Messages[3]["reasoning_content"] != "kept" {
+		t.Fatalf("existing reasoning_content should be preserved: %v", payload.Messages[3])
+	}
+	// 无 tool_calls 的 assistant 不动
+	if _, exists := payload.Messages[4]["reasoning_content"]; exists {
+		t.Fatalf("assistant without tool calls should not be patched: %v", payload.Messages[4])
+	}
+}
+
+func TestRelayServerProviderGatewayBackfillsKimiReasoningContent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		upstreamBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"k2p6","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	kimiBaseURL := mustRewriteHostURL(t, upstream.URL, "api.kimi.com") + "/coding/v1"
+	gateway := &providerGatewaySpec{
+		BaseURL:        kimiBaseURL,
+		APIKey:         "kimi-key",
+		UpstreamModel:  "k2p6",
+		UpstreamModels: []string{"k2p6"},
+		WireAPI:        "chat_completions",
+	}
+	spec := &apiKeySpec{ID: "pg", Label: "PG", Key: "client-key", Enabled: true, ProviderGateway: gateway}
+	m := &manifest{
+		APIKeys:       []apiKeySpec{*spec},
+		ModelIDs:      []string{"k2p6"},
+		apiKeyByValue: map[string]*apiKeySpec{"client-key": spec},
+	}
+	router := (&relayServer{
+		runtime:  &fakeRuntime{},
+		cfg:      &config.Config{},
+		manifest: m,
+		policy:   &requestPolicy{manifest: m},
+		httpClient: &http.Client{
+			Transport: rewriteDialHostRoundTripper(t, "api.kimi.com", upstream.Listener.Addr().String()),
+		},
+	}).router()
+
+	// 历史会话:assistant 工具调用无 reasoning 输入项
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"k2p6","stream":false,"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"function_call","call_id":"call_1","name":"t","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	var upstreamPayload struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(upstreamBody), &upstreamPayload); err != nil {
+		t.Fatalf("unmarshal upstream body: %v", err)
+	}
+	found := false
+	for _, message := range upstreamPayload.Messages {
+		if message["role"] != "assistant" {
+			continue
+		}
+		if _, hasToolCalls := message["tool_calls"]; !hasToolCalls {
+			continue
+		}
+		found = true
+		if _, exists := message["reasoning_content"]; !exists {
+			t.Fatalf("assistant tool call message should carry reasoning_content: %s", upstreamBody)
+		}
+	}
+	if !found {
+		t.Fatalf("assistant tool call message missing in upstream body: %s", upstreamBody)
+	}
+}
+
+func TestRelayServerProviderGatewayInjectsKimiHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamPath string
+	var upstreamAuth string
+	var upstreamUserAgent string
+	var upstreamPlatform string
+	var upstreamVersion string
+	var upstreamDeviceName string
+	var upstreamDeviceModel string
+	var upstreamDeviceID string
+	var upstreamBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		upstreamAuth = r.Header.Get("Authorization")
+		upstreamUserAgent = r.Header.Get("User-Agent")
+		upstreamPlatform = r.Header.Get("X-Msh-Platform")
+		upstreamVersion = r.Header.Get("X-Msh-Version")
+		upstreamDeviceName = r.Header.Get("X-Msh-Device-Name")
+		upstreamDeviceModel = r.Header.Get("X-Msh-Device-Model")
+		upstreamDeviceID = r.Header.Get("X-Msh-Device-Id")
+		body, _ := io.ReadAll(r.Body)
+		upstreamBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"k2p6","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	kimiBaseURL := mustRewriteHostURL(t, upstream.URL, "api.kimi.com") + "/coding/v1"
+	gateway := &providerGatewaySpec{
+		BaseURL:        kimiBaseURL,
+		APIKey:         "kimi-key",
+		UpstreamModel:  "k2p6",
+		UpstreamModels: []string{"k2p6"},
+		WireAPI:        "chat_completions",
+	}
+	m := &manifest{
+		APIKeys: []apiKeySpec{{
+			ID:      "provider_gateway_account_1",
+			Label:   "Provider Gateway",
+			Key:     "client-key",
+			Enabled: true,
+			ProviderGateway: &providerGatewaySpec{
+				BaseURL:        gateway.BaseURL,
+				APIKey:         gateway.APIKey,
+				UpstreamModel:  gateway.UpstreamModel,
+				UpstreamModels: gateway.UpstreamModels,
+				WireAPI:        gateway.WireAPI,
+			},
+		}},
+		ModelIDs: []string{"k2p6"},
+		apiKeyByValue: map[string]*apiKeySpec{
+			"client-key": {
+				ID:      "provider_gateway_account_1",
+				Label:   "Provider Gateway",
+				Key:     "client-key",
+				Enabled: true,
+				ProviderGateway: &providerGatewaySpec{
+					BaseURL:        gateway.BaseURL,
+					APIKey:         gateway.APIKey,
+					UpstreamModel:  gateway.UpstreamModel,
+					UpstreamModels: gateway.UpstreamModels,
+					WireAPI:        gateway.WireAPI,
+				},
+			},
+		},
+	}
+	router := (&relayServer{
+		runtime:  &fakeRuntime{},
+		cfg:      &config.Config{},
+		manifest: m,
+		policy:   &requestPolicy{manifest: m},
+		httpClient: &http.Client{
+			Transport: rewriteDialHostRoundTripper(t, "api.kimi.com", upstream.Listener.Addr().String()),
+		},
+	}).router()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"k2p6","input":"hello","stream":false}`))
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if upstreamPath != "/coding/v1/chat/completions" {
+		t.Fatalf("unexpected upstream path: %s", upstreamPath)
+	}
+	if upstreamAuth != "Bearer kimi-key" {
+		t.Fatalf("unexpected upstream auth: %s", upstreamAuth)
+	}
+	if upstreamUserAgent != "KimiCLI/1.10.6" {
+		t.Fatalf("unexpected upstream user-agent: %q", upstreamUserAgent)
+	}
+	if upstreamPlatform != "kimi_cli" || upstreamVersion != "1.10.6" {
+		t.Fatalf("unexpected kimi headers: platform=%q version=%q", upstreamPlatform, upstreamVersion)
+	}
+	if strings.TrimSpace(upstreamDeviceName) == "" || strings.TrimSpace(upstreamDeviceModel) == "" || strings.TrimSpace(upstreamDeviceID) == "" {
+		t.Fatalf("kimi device headers should be populated: name=%q model=%q id=%q", upstreamDeviceName, upstreamDeviceModel, upstreamDeviceID)
+	}
+	if !strings.Contains(upstreamBody, `"model":"k2p6"`) {
+		t.Fatalf("request should use k2p6 upstream model: %s", upstreamBody)
+	}
+}
+
+func rewriteDialHostRoundTripper(t *testing.T, expectedHost string, targetAddr string) http.RoundTripper {
+	t.Helper()
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.DialContext = func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		if strings.HasPrefix(addr, expectedHost+":") {
+			addr = targetAddr
+		}
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, addr)
+	}
+	// 环境代理（HTTP_PROXY 等）会让请求绕过上面的拨号重写，必须禁用
+	base.Proxy = nil
+	return base
+}
+
+func mustRewriteHostURL(t *testing.T, rawURL string, host string) string {
+	t.Helper()
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	port := parsed.Port()
+	if port == "" {
+		t.Fatalf("upstream url missing port: %s", rawURL)
+	}
+	parsed.Host = net.JoinHostPort(host, port)
+	return parsed.String()
 }
 
 func TestRelayServerProviderGatewayChatStreamTerminatesResponsesSSEFrames(t *testing.T) {
@@ -964,6 +1210,174 @@ func TestRelayServerProviderGatewayRejectsVisionInputWhenUnsupported(t *testing.
 	}
 	if !strings.Contains(w.Body.String(), "unsupported_image_input") {
 		t.Fatalf("unsupported image input should return explicit error: %s", w.Body.String())
+	}
+}
+
+func TestResolveGatewayForModelMixedPool(t *testing.T) {
+	gatewayA := &providerGatewaySpec{
+		BaseURL:        "https://api.kimi.com/coding/v1",
+		APIKey:         "kimi-a",
+		UpstreamModel:  "k2p6",
+		UpstreamModels: []string{"k2p6"},
+		WireAPI:        "chat_completions",
+	}
+	gatewayB := &providerGatewaySpec{
+		BaseURL:        "https://api.kimi.com/coding/v1",
+		APIKey:         "kimi-b",
+		UpstreamModel:  "k2p6",
+		UpstreamModels: []string{"k2p6"},
+		WireAPI:        "chat_completions",
+	}
+	gatewayDisabled := &providerGatewaySpec{
+		BaseURL:        "https://api.xiaomimimo.com/v1",
+		APIKey:         "mimo",
+		UpstreamModel:  "mimo-k1.5",
+		UpstreamModels: []string{"mimo-k1.5"},
+		WireAPI:        "chat_completions",
+	}
+	m := &manifest{
+		ModelIDs: []string{"gpt-5.5", "gpt-5.4"},
+		APIKeys: []apiKeySpec{
+			{ID: "main", Key: "main-key", Enabled: true},
+			{ID: "pg_a", Key: "key-a", Enabled: true, ProviderGateway: gatewayA},
+			{ID: "pg_b", Key: "key-b", Enabled: true, ProviderGateway: gatewayB},
+			{ID: "pg_off", Key: "key-off", Enabled: false, ProviderGateway: gatewayDisabled},
+		},
+	}
+	mainSpec := &apiKeySpec{ID: "main", Key: "main-key", Enabled: true}
+
+	// 池内模型不分流
+	if gateway := resolveGatewayForModel(m, mainSpec, "gpt-5.5"); gateway != nil {
+		t.Fatalf("pool model should not route to gateway: %+v", gateway)
+	}
+	// 池外模型路由到网关，多个候选轮询
+	seenKeys := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		gateway := resolveGatewayForModel(m, mainSpec, "k2p6")
+		if gateway == nil {
+			t.Fatal("gateway model should route to provider gateway")
+		}
+		seenKeys[gateway.APIKey] = true
+	}
+	if !seenKeys["kimi-a"] || !seenKeys["kimi-b"] {
+		t.Fatalf("expected round-robin across gateway candidates, got: %v", seenKeys)
+	}
+	// 禁用条目不参与路由
+	if gateway := resolveGatewayForModel(m, mainSpec, "mimo-k1.5"); gateway != nil {
+		t.Fatalf("disabled gateway entry should not route: %+v", gateway)
+	}
+	// 网关密钥自身不做二次分流
+	gatewaySpec := &apiKeySpec{ID: "pg_a", Key: "key-a", Enabled: true, ProviderGateway: gatewayA}
+	if gateway := resolveGatewayForModel(m, gatewaySpec, "k2p6"); gateway != nil {
+		t.Fatal("gateway key should not re-route")
+	}
+	// 密钥模型过滤生效
+	restrictedSpec := &apiKeySpec{ID: "main", Key: "main-key", Enabled: true, ExcludedModels: []string{"k2p6"}}
+	if gateway := resolveGatewayForModel(m, restrictedSpec, "k2p6"); gateway != nil {
+		t.Fatal("excluded model should not route to gateway")
+	}
+}
+
+func TestVisibleModelsForAPIKeyIncludesGatewayModelsForPoolKeys(t *testing.T) {
+	m := &manifest{
+		ModelIDs: []string{"gpt-5.5"},
+		APIKeys: []apiKeySpec{
+			{ID: "pg_a", Key: "key-a", Enabled: true, ProviderGateway: &providerGatewaySpec{
+				UpstreamModel:  "k2p6",
+				UpstreamModels: []string{"k2p6"},
+			}},
+			{ID: "pg_off", Key: "key-off", Enabled: false, ProviderGateway: &providerGatewaySpec{
+				UpstreamModel:  "mimo-k1.5",
+				UpstreamModels: []string{"mimo-k1.5"},
+			}},
+		},
+	}
+
+	models := visibleModelsForAPIKey(m, &apiKeySpec{ID: "main", Key: "main-key", Enabled: true})
+	joined := strings.Join(models, ",")
+	if !strings.Contains(joined, "gpt-5.5") || !strings.Contains(joined, "k2p6") {
+		t.Fatalf("pool key should see pool and gateway models: %#v", models)
+	}
+	if strings.Contains(joined, "mimo-k1.5") {
+		t.Fatalf("disabled gateway entry models should stay hidden: %#v", models)
+	}
+
+	// 网关密钥仍只看到自己的模型
+	gatewayModels := visibleModelsForAPIKey(m, &m.APIKeys[0])
+	if len(gatewayModels) != 1 || gatewayModels[0] != "k2p6" {
+		t.Fatalf("gateway key should only see its own models: %#v", gatewayModels)
+	}
+}
+
+func TestRelayServerMainKeyRoutesGatewayModelThroughMixedPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"k2p6","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	gateway := &providerGatewaySpec{
+		BaseURL:        upstream.URL,
+		APIKey:         "kimi-key",
+		UpstreamModel:  "k2p6",
+		UpstreamModels: []string{"k2p6"},
+		WireAPI:        "chat_completions",
+	}
+	mainSpec := &apiKeySpec{ID: "main", Label: "Default", Key: "main-key", Enabled: true}
+	m := &manifest{
+		ModelIDs: []string{"gpt-5.5"},
+		APIKeys: []apiKeySpec{
+			*mainSpec,
+			{ID: "pg_kimi", Label: "Provider Gateway", Key: "kimi-client-key", Enabled: true, ProviderGateway: gateway},
+		},
+		apiKeyByValue: map[string]*apiKeySpec{
+			"main-key": mainSpec,
+		},
+	}
+	runtime := &fakeRuntime{}
+	router := (&relayServer{
+		runtime:  runtime,
+		cfg:      &config.Config{},
+		manifest: m,
+		policy:   &requestPolicy{manifest: m},
+	}).router()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"k2p6","input":"hello","stream":false}`))
+	req.Header.Set("Authorization", "Bearer main-key")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.HasSuffix(upstreamPath, "/chat/completions") {
+		t.Fatalf("gateway model should hit upstream chat completions, got: %s", upstreamPath)
+	}
+	if runtime.executeCalls != 0 || runtime.streamCalls != 0 {
+		t.Fatal("gateway-routed request should not touch pool runtime")
+	}
+}
+
+func TestProviderGatewayVisionDetectionIgnoresToolSchemas(t *testing.T) {
+	// codex 0.139 的 multi_agent_v1 工具 schema 中含有名为 image_url 的属性，
+	// 不应被当成请求携带图片。
+	toolSchemaBody := []byte(`{"model":"k2p6","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"multi_agent_v1","parameters":{"properties":{"items":{"items":{"properties":{"image_url":{"type":"string","description":"Image URL when type is image."}}}}}}}]}`)
+	if providerGatewayRequestHasVisionInput(toolSchemaBody) {
+		t.Fatal("tool schema containing image_url property should not be detected as vision input")
+	}
+
+	responsesImageBody := []byte(`{"model":"k2p6","input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,abc"}]}]}`)
+	if !providerGatewayRequestHasVisionInput(responsesImageBody) {
+		t.Fatal("responses input_image should be detected as vision input")
+	}
+
+	chatImageBody := []byte(`{"model":"k2p6","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`)
+	if !providerGatewayRequestHasVisionInput(chatImageBody) {
+		t.Fatal("chat image_url content should be detected as vision input")
 	}
 }
 

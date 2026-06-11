@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1008,7 +1009,31 @@ func visibleModelsForAPIKey(m *manifest, spec *apiKeySpec) []string {
 	if spec != nil && spec.ProviderGateway != nil {
 		return append([]string(nil), spec.ProviderGateway.UpstreamModels...)
 	}
-	models := applyModelFilters(m.ModelIDs, nil, m.ExcludedModels)
+	// 混合池：集合内网关条目的模型对非网关密钥一并可见
+	baseModels := append([]string(nil), m.ModelIDs...)
+	seen := make(map[string]struct{}, len(baseModels))
+	for _, model := range baseModels {
+		seen[strings.ToLower(strings.TrimSpace(model))] = struct{}{}
+	}
+	for i := range m.APIKeys {
+		entry := &m.APIKeys[i]
+		if !entry.Enabled || entry.ProviderGateway == nil {
+			continue
+		}
+		for _, upstream := range entry.ProviderGateway.UpstreamModels {
+			trimmed := strings.TrimSpace(upstream)
+			if trimmed == "" {
+				continue
+			}
+			key := strings.ToLower(trimmed)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			baseModels = append(baseModels, trimmed)
+		}
+	}
+	models := applyModelFilters(baseModels, nil, m.ExcludedModels)
 	if spec != nil {
 		models = applyModelFilters(models, spec.AllowedModels, spec.ExcludedModels)
 		if strings.TrimSpace(spec.ModelPrefix) != "" {
@@ -1159,11 +1184,19 @@ func providerGatewayRequestHasVisionInput(body []byte) bool {
 	if len(body) == 0 || !json.Valid(body) {
 		return false
 	}
-	var payload any
+	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return false
 	}
-	return providerGatewayValueHasVisionInput(payload)
+	// 仅检查实际消息内容（responses 的 input、chat 的 messages）。
+	// tools 的 JSON Schema 中可能存在名为 image_url 的属性（如 codex 0.139
+	// multi_agent_v1 工具），扫描整个请求体会造成视觉输入误判。
+	for _, key := range []string{"input", "messages"} {
+		if value, ok := payload[key]; ok && providerGatewayValueHasVisionInput(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func providerGatewayValueHasVisionInput(value any) bool {
@@ -1188,6 +1221,70 @@ func providerGatewayValueHasVisionInput(value any) bool {
 		}
 	}
 	return false
+}
+
+var providerGatewayRouteCounter atomic.Uint64
+
+// resolveGatewayForModel 实现混合池：非网关密钥请求池外模型时，
+// 按模型分流到集合内的供应商网关条目；池内模型（含别名）仍走账号池，
+// 多个候选条目之间轮询。
+func resolveGatewayForModel(m *manifest, spec *apiKeySpec, model string) *providerGatewaySpec {
+	if m == nil || spec == nil || spec.ProviderGateway != nil {
+		return nil
+	}
+	requested := strings.TrimSpace(stripModelPrefix(model, spec))
+	if requested == "" || isCodexInternalModel(requested) {
+		return nil
+	}
+	normalized := strings.ToLower(requested)
+	for _, poolModel := range m.ModelIDs {
+		if strings.EqualFold(strings.TrimSpace(poolModel), requested) {
+			return nil
+		}
+	}
+	if m.aliasToSource != nil {
+		if _, ok := m.aliasToSource[normalized]; ok {
+			return nil
+		}
+	}
+	if !modelAllowedByAPIKeyFilters(requested, spec) {
+		return nil
+	}
+	var candidates []*providerGatewaySpec
+	for i := range m.APIKeys {
+		entry := &m.APIKeys[i]
+		if !entry.Enabled || entry.ProviderGateway == nil {
+			continue
+		}
+		if providerGatewaySupportsModel(entry.ProviderGateway, requested) {
+			candidates = append(candidates, entry.ProviderGateway)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	index := providerGatewayRouteCounter.Add(1) - 1
+	return candidates[int(index%uint64(len(candidates)))]
+}
+
+func providerGatewaySupportsModel(gateway *providerGatewaySpec, model string) bool {
+	if gateway == nil {
+		return false
+	}
+	for _, upstream := range gateway.UpstreamModels {
+		if strings.EqualFold(strings.TrimSpace(upstream), model) {
+			return true
+		}
+	}
+	return strings.EqualFold(strings.TrimSpace(gateway.UpstreamModel), model)
+}
+
+func modelAllowedByAPIKeyFilters(model string, spec *apiKeySpec) bool {
+	if spec == nil {
+		return true
+	}
+	filtered := applyModelFilters([]string{model}, spec.AllowedModels, spec.ExcludedModels)
+	return len(filtered) > 0
 }
 
 func stripModelPrefix(model string, spec *apiKeySpec) string {
@@ -2252,11 +2349,12 @@ type executorRuntime interface {
 }
 
 type relayServer struct {
-	runtime  executorRuntime
-	cfg      *config.Config
-	manifest *manifest
-	emitter  *eventEmitter
-	policy   *requestPolicy
+	runtime    executorRuntime
+	cfg        *config.Config
+	manifest   *manifest
+	emitter    *eventEmitter
+	policy     *requestPolicy
+	httpClient *http.Client
 }
 
 func (s *relayServer) router() *gin.Engine {
@@ -3185,6 +3283,17 @@ func (s *relayServer) handleExecutorBody(c *gin.Context, spec *apiKeySpec, body 
 		s.handleProviderGatewayRequest(c, spec.ProviderGateway, body, model, sourceFormat, fixedAlt)
 		return
 	}
+	if gateway := resolveGatewayForModel(s.manifest, spec, model); gateway != nil {
+		s.handleProviderGatewayRequest(
+			c,
+			gateway,
+			body,
+			stripModelPrefix(model, spec),
+			sourceFormat,
+			fixedAlt,
+		)
+		return
+	}
 
 	alt := fixedAlt
 	if alt == "" {
@@ -3256,6 +3365,9 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 			return
 		}
 		upstreamPath = "/v1/chat/completions"
+		if providerGatewayBaseURLUsesKimiHeaders(gateway.BaseURL) {
+			upstreamBody = ensureKimiAssistantReasoningContent(upstreamBody)
+		}
 	} else if !sourceFormatEqual(sourceFormat, sdktranslator.FormatOpenAIResponse) {
 		writeAPIError(c, http.StatusBadRequest, "provider gateway responses wire API only accepts responses requests", "invalid_request")
 		return
@@ -3277,8 +3389,9 @@ func (s *relayServer) handleProviderGatewayRequest(c *gin.Context, gateway *prov
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
+	applyProviderGatewayUpstreamHeaders(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.providerGatewayHTTPClient().Do(req)
 	if err != nil {
 		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
 		return
@@ -3564,6 +3677,102 @@ func providerGatewayURL(baseURL string, path string) (string, error) {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String(), nil
+}
+
+func (s *relayServer) providerGatewayHTTPClient() *http.Client {
+	if s != nil && s.httpClient != nil {
+		return s.httpClient
+	}
+	return http.DefaultClient
+}
+
+func applyProviderGatewayUpstreamHeaders(req *http.Request) {
+	if req == nil || req.URL == nil {
+		return
+	}
+	if !providerGatewayUsesKimiHeaders(req.URL) {
+		return
+	}
+	req.Header.Set("User-Agent", "KimiCLI/1.10.6")
+	req.Header.Set("X-Msh-Platform", "kimi_cli")
+	req.Header.Set("X-Msh-Version", "1.10.6")
+	req.Header.Set("X-Msh-Device-Name", providerGatewayKimiHostname())
+	req.Header.Set("X-Msh-Device-Model", providerGatewayKimiDeviceModel())
+	req.Header.Set("X-Msh-Device-Id", providerGatewayKimiDeviceID())
+}
+
+func providerGatewayUsesKimiHeaders(upstreamURL *url.URL) bool {
+	if upstreamURL == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(upstreamURL.Hostname()), "api.kimi.com")
+}
+
+func providerGatewayBaseURLUsesKimiHeaders(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil {
+		return false
+	}
+	return providerGatewayUsesKimiHeaders(parsed)
+}
+
+// ensureKimiAssistantReasoningContent 兜底补齐 reasoning_content：
+// kimi 开启 thinking 时要求带工具调用的 assistant 消息必须携带该字段，
+// 旧客户端或修复前产生的历史会话可能缺失，统一补空串（实测可通过）。
+func ensureKimiAssistantReasoningContent(body []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return body
+	}
+	changed := false
+	for _, item := range messages {
+		message, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := message["role"].(string); role != "assistant" {
+			continue
+		}
+		toolCalls, ok := message["tool_calls"].([]any)
+		if !ok || len(toolCalls) == 0 {
+			continue
+		}
+		if _, exists := message["reasoning_content"]; exists {
+			continue
+		}
+		message["reasoning_content"] = ""
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	next, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return next
+}
+
+func providerGatewayKimiHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil || strings.TrimSpace(hostname) == "" {
+		return "unknown"
+	}
+	return hostname
+}
+
+func providerGatewayKimiDeviceModel() string {
+	return fmt.Sprintf("%s %s", goruntime.GOOS, goruntime.GOARCH)
+}
+
+func providerGatewayKimiDeviceID() string {
+	seed := providerGatewayKimiHostname() + "|" + goruntime.GOOS + "|" + goruntime.GOARCH
+	sum := sha256.Sum256([]byte(seed))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func (s *relayServer) handleNonStream(c *gin.Context, body []byte, model string, sourceFormat sdktranslator.Format, alt string) {
@@ -4107,6 +4316,10 @@ func (s *relayServer) handleOllamaChat(c *gin.Context) {
 		s.handleOllamaProviderGatewayChat(c, spec.ProviderGateway, openAIBody, canonical, stream)
 		return
 	}
+	if gateway := resolveGatewayForModel(s.manifest, spec, canonical); gateway != nil {
+		s.handleOllamaProviderGatewayChat(c, gateway, openAIBody, canonical, stream)
+		return
+	}
 	if stream {
 		s.handleOllamaRuntimeStream(c, openAIBody, canonical)
 		return
@@ -4450,7 +4663,8 @@ func (s *relayServer) handleOllamaProviderGatewayChat(c *gin.Context, gateway *p
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	applyProviderGatewayUpstreamHeaders(req)
+	resp, err := s.providerGatewayHTTPClient().Do(req)
 	if err != nil {
 		writeAPIError(c, http.StatusBadGateway, err.Error(), "bad_gateway")
 		return
