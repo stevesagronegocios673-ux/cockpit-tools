@@ -62,6 +62,91 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MergeConsecutiveFu
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DedupesToolsAcrossSearchOutputs(t *testing.T) {
+	raw := []byte(`{
+		"tools": [
+			{"type":"namespace","name":"codex_app","tools":[
+				{"type":"function","name":"read_thread","description":"current definition","parameters":{"type":"object","properties":{}}}
+			]}
+		],
+		"input": [
+			{"type":"tool_search_output","call_id":"ts_1","tools":[
+				{"type":"function","name":"codex_app__read_thread","description":"snapshot one","parameters":{"type":"object","properties":{}}}
+			]},
+			{"type":"tool_search_output","call_id":"ts_2","tools":[
+				{"type":"function","name":"codex_app__read_thread","description":"snapshot two","parameters":{"type":"object","properties":{}}}
+			]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k2p6", raw, true)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	names := map[string]int{}
+	for _, tool := range gjson.GetBytes(out, "tools").Array() {
+		names[tool.Get("function.name").String()]++
+	}
+	if names["codex_app__read_thread"] != 1 {
+		t.Fatalf("codex_app__read_thread should appear exactly once, got %d (all: %v)", names["codex_app__read_thread"], names)
+	}
+	// 保留首个:顶层 tools 的当前定义优先于历史快照
+	for _, tool := range gjson.GetBytes(out, "tools").Array() {
+		if tool.Get("function.name").String() == "codex_app__read_thread" {
+			if got := tool.Get("function.description").String(); got != "current definition" {
+				t.Fatalf("should keep the top-level tool definition, got description %q", got)
+			}
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CarriesReasoningIntoToolCallMessage(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"先看目录结构"}],"content":[{"type":"reasoning_text","text":"需要执行 ls"}]},
+			{"type":"function_call","call_id":"exec_command:0","name":"exec_command","arguments":"{\"cmd\":\"ls\"}"},
+			{"type":"function_call_output","call_id":"exec_command:0","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k2p6", raw, true)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("messages.0.role = %q, want assistant", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.reasoning_content").String(); got != "先看目录结构\n需要执行 ls" {
+		t.Fatalf("messages.0.reasoning_content = %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReasoningDoesNotLeakAcrossTurns(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"上一轮思考"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"中间回复"}]},
+			{"type":"function_call","call_id":"exec_command:1","name":"exec_command","arguments":"{}"},
+			{"type":"function_call_output","call_id":"exec_command:1","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("k2p6", raw, true)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	var toolCallMessage gjson.Result
+	for _, msg := range gjson.GetBytes(out, "messages").Array() {
+		if msg.Get("role").String() == "assistant" && msg.Get("tool_calls").Exists() {
+			toolCallMessage = msg
+		}
+	}
+	if !toolCallMessage.Exists() {
+		t.Fatal("assistant tool call message should exist")
+	}
+	if toolCallMessage.Get("reasoning_content").Exists() {
+		t.Fatalf("stale reasoning should not leak into later tool call message: %s", toolCallMessage.Raw)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_SplitFunctionCallsWhenInterrupted(t *testing.T) {
 	raw := []byte(`{
 		"input": [

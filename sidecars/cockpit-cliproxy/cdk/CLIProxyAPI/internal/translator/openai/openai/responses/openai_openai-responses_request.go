@@ -139,6 +139,33 @@ func appendResponsesToolToChatTools(chatTools *[]interface{}, tool gjson.Result,
 	}
 }
 
+// dedupeChatToolsByName 按 function.name 去重（保留首个，顶层 tools 优先于
+// input 历史中 tool_search_output 携带的快照）。kimi 等上游严格校验工具名唯一性。
+func dedupeChatToolsByName(tools []interface{}) []interface{} {
+	if len(tools) <= 1 {
+		return tools
+	}
+	seen := make(map[string]struct{}, len(tools))
+	next := make([]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		name := ""
+		if toolMap, ok := tool.(map[string]interface{}); ok {
+			if function, ok := toolMap["function"].(map[string]interface{}); ok {
+				name, _ = function["name"].(string)
+			}
+		}
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key != "" {
+			if _, duplicated := seen[key]; duplicated {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		next = append(next, tool)
+	}
+	return next
+}
+
 func appendToolSearchOutputTools(chatTools *[]interface{}, value gjson.Result) {
 	if !value.Exists() {
 		return
@@ -296,6 +323,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 		pendingToolCalls := make([]interface{}, 0)
 		pendingToolCallIDs := make([]string, 0)
+		pendingReasoning := ""
 		awaitingToolOutputs := make(map[string]struct{})
 		deferredMessages := make([][]byte, 0)
 
@@ -305,6 +333,12 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 			assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
 			assistantMessage, _ = sjson.SetBytes(assistantMessage, "tool_calls", pendingToolCalls)
+			// 思维链往返：开启 thinking 的 chat_completions 上游（如 kimi）要求
+			// 带工具调用的 assistant 消息携带 reasoning_content
+			if pendingReasoning != "" {
+				assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", pendingReasoning)
+				pendingReasoning = ""
+			}
 			out, _ = sjson.SetRawBytes(out, "messages.-1", assistantMessage)
 			for _, id := range pendingToolCallIDs {
 				if strings.TrimSpace(id) == "" {
@@ -346,6 +380,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 			if !isResponsesToolCallItem(itemType) {
 				flushPendingToolCalls()
+				// 思维链只属于紧随其后的工具调用；遇到其他类型的输入项即丢弃，
+				// 避免泄漏到下一轮的 assistant 消息
+				if itemType != "reasoning" {
+					pendingReasoning = ""
+				}
 			}
 
 			switch itemType {
@@ -393,6 +432,28 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				appendRegularMessage(message)
+
+			case "reasoning":
+				// 缓存思维链文本，回填到随后工具调用的 assistant 消息
+				parts := make([]string, 0, 2)
+				appendReasoningText := func(_, entry gjson.Result) bool {
+					if text := strings.TrimSpace(entry.Get("text").String()); text != "" {
+						parts = append(parts, text)
+					}
+					return true
+				}
+				if summary := item.Get("summary"); summary.Exists() && summary.IsArray() {
+					summary.ForEach(appendReasoningText)
+				}
+				if content := item.Get("content"); content.Exists() && content.IsArray() {
+					content.ForEach(appendReasoningText)
+				}
+				if len(parts) > 0 {
+					if pendingReasoning != "" {
+						pendingReasoning += "\n"
+					}
+					pendingReasoning += strings.Join(parts, "\n")
+				}
 
 			case "function_call", "custom_tool_call", "tool_search_call":
 				// Buffer consecutive function calls and emit them as one assistant message.
@@ -474,6 +535,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		})
 	}
 	appendToolSearchOutputTools(&chatCompletionsTools, root.Get("input"))
+	chatCompletionsTools = dedupeChatToolsByName(chatCompletionsTools)
 	if len(chatCompletionsTools) > 0 {
 		out, _ = sjson.SetBytes(out, "tools", chatCompletionsTools)
 	}
